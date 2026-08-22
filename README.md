@@ -59,7 +59,7 @@
 
 ```sh
 # 私有/未绑定账号的仓库记得改成你自己的 owner 与提交
-dsh plugin add github:<YOUR_GITHUB_USER>/dsh-sound-player
+dsh plugin add github:LaoQianwocao/dsh-sound-player
 ```
 
 第一次安装若 pnpm 提示需要允许构建脚本，把打印出的包 `key` 填入

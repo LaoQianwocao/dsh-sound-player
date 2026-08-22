@@ -35,7 +35,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/<YOUR_GITHUB_USER>/dsh-sound-player.git"
+    "url": "git+https://github.com/LaoQianwocao/dsh-sound-player.git"
   },
   "license": "MIT"
 }
