@@ -1,0 +1,7 @@
+# dsh-sound-player 的加载层：注册为本插件的宿主端行。
+# 该行让 DSH 的 loader 加载本包（node 半段，见 lib/index.js），同时
+# package.json 的 dsh.client 声明会自动把 browser 端模块纳入
+# window.__DSH_BOOT__ 客户端模块图。
+- insert:
+    - id: sound-player
+      name: dsh-sound-player
