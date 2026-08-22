@@ -3,7 +3,7 @@
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) Web GUI 开发的**音效播放器**插件，
 以**悬浮窗**形式常驻对话界面。发布为 DSH 客户端插件（`dsh.client`），支持 GitHub / npm / tarball 分发。
 
-> 本插件是「音效播放器」，与另一个名为 dev-board / 开发者黑板 的插件项目无关。
+> 本插件是「音效播放器」，在用户进行对话时，可以在各种阶段（对话终止，请求权限，危险提示等）发出提示音，提醒用户处理相应状况。
 
 ## 功能
 
@@ -58,7 +58,6 @@
 ### 从 GitHub 安装（推荐）
 
 ```sh
-# 私有/未绑定账号的仓库记得改成你自己的 owner 与提交
 dsh plugin add github:LaoQianwocao/dsh-sound-player
 ```
 
