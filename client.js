@@ -855,7 +855,7 @@ window.__ModuleLoader__.load({
 				name: "settings.section",
 				id: "sound-player",
 				order: 30,
-				label: () => "🎵 音效播放器",
+				label: () => "音效播放器",
 				inject: () => ({ board: soundPlayer })
 			}, App));
 			return () => { try { dispose(); } catch (err) { /* */ } };
