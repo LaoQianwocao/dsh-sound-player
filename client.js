@@ -1,9 +1,8 @@
 /* dsh-sound-player — DSH Web 音效播放器（浏览器端）。
  * 功能：
- *   1. 悬浮窗音效播放器：可拖动，拖到边缘缩进隐藏，鼠标靠近弹出（随机弹出动画）。
- *   2. 弹窗配置：导入音频（文件/文件夹/拖拽），为各种“情况”绑定音效 + 开关。
- *   3. 内置情况：对话完成、提问时、权限请求时、被提问时、服务终止时。
- *   4. 供其他插件使用的 API：导入音频、增添情况、触发情况并播放音效。
+ *   1. 设置页音效播放器：所有操作（总开关 / 音量 / 情况绑定 / 音效导入）都在设置菜单完成。
+ *   2. 内置情况：对话完成、发送消息、权限请求、被提问、服务终止、子代理运行完成、最后一个子代理运行完成。
+ *   3. 供其他插件使用的 API：导入音频、增添情况、触发情况并播放音效。
  * 通过 window.__ModuleLoader__.load 注册；exports.inject / exports.apply 为 cordis 客户端插件契约。
  */
 window.__ModuleLoader__.load({
@@ -14,19 +13,19 @@ window.__ModuleLoader__.load({
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
 		let React = require("react");
-		let ReactDOM = require("react-dom");
 
 		// #region 常量
 		const CONFIG_KEY = "dsh-sound-player:config:v1";
 		const DB_NAME = "dsh-sound-player";
 		const DB_STORE = "sounds";
-		const POP_ANIMATIONS = ["dsp-pop-slide", "dsp-pop-zoom", "dsp-pop-rise", "dsp-pop-flip", "dsp-pop-fade"];
 		const TRIGGER_LABELS = {
 			"turn-end": "对话完成",
 			"user-message": "发送消息时",
 			"approval-requested": "权限请求时",
 			"question-requested": "被提问时",
 			"stream-end": "服务终止时",
+			"subagent-complete": "子代理运行完成",
+			"last-subagent-complete": "最后一个子代理运行完成",
 			"manual": "手动触发（插件调用）"
 		};
 		// #endregion
@@ -111,7 +110,9 @@ window.__ModuleLoader__.load({
 			{ id: "user-ask", label: "发送消息时提示", trigger: "user-message", enabled: true, audioId: "sys-ding", builtin: true },
 			{ id: "permission-request", label: "权限请求时提示", trigger: "approval-requested", enabled: true, audioId: "synth-warn", builtin: true },
 			{ id: "agent-question", label: "被提问时提示", trigger: "question-requested", enabled: true, audioId: "synth-question", builtin: true },
-			{ id: "service-stop", label: "服务终止时提示", trigger: "stream-end", enabled: true, audioId: "synth-stop", builtin: true }
+			{ id: "service-stop", label: "服务终止时提示", trigger: "stream-end", enabled: true, audioId: "synth-stop", builtin: true },
+			{ id: "subagent-done", label: "子代理运行完成", trigger: "subagent-complete", enabled: true, audioId: "synth-complete", builtin: true },
+			{ id: "last-subagent-done", label: "最后一个子代理运行完成", trigger: "last-subagent-complete", enabled: true, audioId: "synth-success", builtin: true }
 		];
 		function defaultConfig() {
 			return {
@@ -119,8 +120,7 @@ window.__ModuleLoader__.load({
 				enabled: true,
 				volume: 0.8,
 				onlyCurrentSession: true,
-				situations: deepClone(DEFAULT_SITUATIONS),
-				float: { x: 24, y: 140 }
+				situations: deepClone(DEFAULT_SITUATIONS)
 			};
 		}
 		function loadConfig() {
@@ -151,8 +151,7 @@ window.__ModuleLoader__.load({
 						if (exist.audioId == null && def.audioId) exist.audioId = def.audioId; // 迁移：老配置自动补默认音效
 					}
 				}
-				if (!cfg.float || typeof cfg.float !== "object") cfg.float = base.float;
-				else delete cfg.float.edge; // 迁移：移除旧的边缘吸附状态
+				delete cfg.float; // 迁移：悬浮窗已迁移至设置菜单，不再需要位置配置
 				return cfg;
 			} catch (err) {
 				return base;
@@ -433,6 +432,72 @@ window.__ModuleLoader__.load({
 				try { if (hostUnsub) hostUnsub(); } catch (err) { /* */ }
 			};
 		}
+
+		// 子代理检测：监听 sessions 列表，origin=subagent 的会话 running 状态翻转。
+		// - subagent-complete：任意子代理从运行中变为完成
+		// - last-subagent-complete：当前会话树内所有运行中的子代理全部完成（一轮"波"结束）
+		function startSubagentWatcher(sessions) {
+			const seen = new Map(); // subagentId -> { parentId, wasRunning }
+			let waveRunning = false; // 当前是否存在运行中的子代理
+			let lastCurrent = undefined;
+			let unsub = null;
+			try {
+				const list = sessions && sessions.list;
+				if (!list || typeof list.subscribe !== "function" || typeof list.getSnapshot !== "function") return null;
+				const isDescendantOf = (candidateId, ancestorId, byId) => {
+					let cur = candidateId;
+					let hops = 0;
+					while (cur !== undefined && cur !== ancestorId && hops < 32) {
+						const s = byId[cur];
+						if (!s || s.origin !== "subagent" || s.parentId === undefined) return false;
+						cur = s.parentId;
+						hops += 1;
+					}
+					return cur === ancestorId;
+				};
+				unsub = list.subscribe(() => {
+					let st;
+					try { st = list.getSnapshot(); } catch (err) { return; }
+					if (!st || !st.byId) return;
+					const current = st.current;
+					if (current !== lastCurrent) {
+						// 切换会话：重置跟踪状态，避免串音
+						lastCurrent = current;
+						seen.clear();
+						waveRunning = false;
+					}
+					const runningNow = [];
+					for (const [id, sum] of Object.entries(st.byId)) {
+						if (!sum || sum.origin !== "subagent") continue;
+						if (current !== undefined && sum.parentId !== undefined && !isDescendantOf(id, current, st.byId)) continue;
+						if (sum.running) runningNow.push(id);
+					}
+					// 检测完成翻转（running: true -> false）
+					for (const [id, rec] of seen) {
+						const sum = st.byId[id];
+						if (sum === undefined) { seen.delete(id); continue; }
+						if (rec.wasRunning && !sum.running) {
+							triggerByEvent("subagent-complete", current);
+						}
+						rec.wasRunning = sum.running;
+					}
+					for (const id of runningNow) {
+						const rec = seen.get(id);
+						if (rec) rec.wasRunning = true;
+						else seen.set(id, { parentId: st.byId[id].parentId, wasRunning: true });
+					}
+					// 波检测：从"有运行中的子代理"变为"无" → 最后一个完成
+					const prevWave = waveRunning;
+					waveRunning = runningNow.length > 0;
+					if (prevWave && !waveRunning) {
+						triggerByEvent("last-subagent-complete", current);
+					}
+				});
+			} catch (err) {
+				return null;
+			}
+			return () => { try { if (unsub) unsub(); } catch (err) { /* */ } };
+		}
 		// #endregion
 
 		// #region soundPlayer 服务（供其他插件与 UI 使用）
@@ -523,18 +588,12 @@ window.__ModuleLoader__.load({
 			setEnabled(v) { config.enabled = !!v; emitChange(); },
 			setVolume(v) { config.volume = clamp(Number(v) || 0, 0, 1); emitChange(); },
 			setOnlyCurrentSession(v) { config.onlyCurrentSession = !!v; emitChange(); },
-			setFloat(pos) {
-				if (!pos || typeof pos !== "object") return;
-				config.float = Object.assign({}, config.float, pos);
-				saveConfig();
-			},
 			getState() {
 				return {
 					enabled: config.enabled,
 					volume: config.volume,
 					onlyCurrentSession: config.onlyCurrentSession,
-					situations: deepClone(config.situations),
-					float: deepClone(config.float)
+					situations: deepClone(config.situations)
 				};
 			},
 			subscribe,
@@ -544,31 +603,11 @@ window.__ModuleLoader__.load({
 
 		// #region 样式
 		const CSS = `
-#dsh-sound-player-root { all: initial; position: fixed; inset: auto auto auto auto; z-index: 2147483000; font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; }
-#dsh-sound-player-root * { box-sizing: border-box; }
-.dsp-pill { position: fixed; z-index: 2147483000; display: flex; align-items: center; justify-content: center; width: 52px; height: 52px; border-radius: 16px; background: linear-gradient(135deg, #2b3a67, #1f2937); color: #dbe4ff; box-shadow: 0 6px 22px rgba(0,0,0,.45); cursor: grab; user-select: none; border: 1px solid rgba(255,255,255,.14); transition: width .18s ease, height .18s ease, border-radius .18s ease, box-shadow .18s ease; }
-.dsp-pill:hover { box-shadow: 0 8px 28px rgba(80,110,255,.35); }
-.dsp-pill.dsp-dragging { cursor: grabbing; opacity: .92; transition: none; }
-.dsp-pill svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.dsp-pill .dsp-pill-badge { position: absolute; top: -4px; right: -4px; width: 14px; height: 14px; border-radius: 50%; background: #34d399; border: 2px solid #111827; display: none; }
-.dsp-pill.dsp-on .dsp-pill-badge { display: block; }
-.dsp-pop-slide { animation: dbbPopSlide .28s cubic-bezier(.2,.9,.3,1.2); }
-.dsp-pop-zoom { animation: dbbPopZoom .3s cubic-bezier(.2,.9,.3,1.25); }
-.dsp-pop-rise { animation: dbbPopRise .3s cubic-bezier(.2,.9,.3,1.15); }
-.dsp-pop-flip { animation: dbbPopFlip .32s cubic-bezier(.2,.9,.3,1.2); }
-.dsp-pop-fade { animation: dbbPopFade .25s ease-out; }
-@keyframes dbbPopSlide { 0% { transform: translateX(var(--dsp-pop-x, 24px)) scale(.92); opacity: .4; } 100% { transform: translateX(0) scale(1); opacity: 1; } }
-@keyframes dbbPopZoom { 0% { transform: scale(.5); opacity: .3; } 100% { transform: scale(1); opacity: 1; } }
-@keyframes dbbPopRise { 0% { transform: translateY(18px) scale(.95); opacity: .4; } 100% { transform: translateY(0) scale(1); opacity: 1; } }
-@keyframes dbbPopFlip { 0% { transform: perspective(320px) rotateX(70deg) scale(.9); opacity: .3; } 100% { transform: perspective(320px) rotateX(0) scale(1); opacity: 1; } }
-@keyframes dbbPopFade { 0% { opacity: 0; transform: scale(.96); } 100% { opacity: 1; transform: scale(1); } }
-.dsp-panel { position: fixed; z-index: 2147483001; width: 380px; max-height: min(620px, 86vh); display: flex; flex-direction: column; border-radius: 16px; background: rgba(17, 24, 39, .96); color: #e5e7eb; box-shadow: 0 18px 60px rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.12); overflow: hidden; font-size: 13px; }
-.dsp-panel-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.03); }
-.dsp-panel-title { font-weight: 600; font-size: 14px; }
-.dsp-close { width: 26px; height: 26px; border: none; border-radius: 8px; background: rgba(255,255,255,.08); color: #d1d5db; cursor: pointer; font-size: 15px; line-height: 1; }
-.dsp-close:hover { background: rgba(255,255,255,.16); }
-.dsp-panel-body { overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
-.dsp-sec { border: 1px solid rgba(255,255,255,.09); border-radius: 12px; padding: 10px 12px; background: rgba(255,255,255,.025); }
+.dsp-settings { display: block; max-width: 680px; padding: 2px 4px 16px; color: #e5e7eb; font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 13px; line-height: 1.5; }
+.dsp-settings * { box-sizing: border-box; }
+.dsp-settings-head { display: flex; align-items: center; gap: 10px; padding: 6px 2px; font-size: 16px; font-weight: 600; }
+.dsp-settings-sub { color: #9ca3af; font-size: 12px; padding: 0 2px 12px; }
+.dsp-sec { border: 1px solid rgba(255,255,255,.09); border-radius: 12px; padding: 10px 12px; background: rgba(255,255,255,.025); margin-bottom: 12px; }
 .dsp-sec-title { font-size: 12px; font-weight: 600; color: #93c5fd; margin-bottom: 8px; letter-spacing: .02em; }
 .dsp-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
 .dsp-toggle { position: relative; width: 34px; height: 19px; flex: none; cursor: pointer; }
@@ -614,14 +653,6 @@ window.__ModuleLoader__.load({
 		// #region React UI
 		const h = React.createElement;
 
-		function IconSpeaker() {
-			return h("svg", { viewBox: "0 0 24 24" },
-				h("path", { d: "M11 5 6 9H3v6h3l5 4V5z" }),
-				h("path", { d: "M15.5 8.5a5 5 0 0 1 0 7" }),
-				h("path", { d: "M18.5 5.5a9 9 0 0 1 0 13" })
-			);
-		}
-
 		function SoundRow({ sound, onTest, onDelete }) {
 			const tag = sound.builtin ? (sound.kind === "synth" ? "合成" : "系统") : "导入";
 			return h("div", { className: "dsp-snd-row" },
@@ -662,95 +693,17 @@ window.__ModuleLoader__.load({
 		function App({ board }) {
 			const [state, setState] = React.useState(() => board.getState());
 			const [sounds, setSounds] = React.useState([]);
-			const [panelOpen, setPanelOpen] = React.useState(false);
-			const [pos, setPos] = React.useState(state.float && typeof state.float.x === "number" ? { x: state.float.x, y: state.float.y } : { x: 24, y: 140 });
-			const [animClass, setAnimClass] = React.useState("");
-			const [dragging, setDragging] = React.useState(false);
 			const [adding, setAdding] = React.useState(false);
 			const [newLabel, setNewLabel] = React.useState("");
 			const [newTrigger, setNewTrigger] = React.useState("manual");
 			const [dropOver, setDropOver] = React.useState(false);
-			const dragRef = React.useRef(null);
-			const movedRef = React.useRef(false);
-			const pillRef = React.useRef(null);
 			const fileRef = React.useRef(null);
 			const dirRef = React.useRef(null);
 
 			React.useEffect(() => board.subscribe(() => setState(board.getState())), [board]);
 			React.useEffect(() => {
-				if (panelOpen) board.listSounds().then(setSounds).catch(() => setSounds([]));
-			}, [panelOpen, board]);
-
-			// 弹窗定位：贴近悬浮窗
-			const panelStyle = (() => {
-				const w = 380;
-				let left = pos.x;
-				let top = pos.y + 60;
-				left = clamp(left, 8, window.innerWidth - w - 8);
-				top = clamp(top, 8, window.innerHeight - 60);
-				return { left, top };
-			})();
-
-			const popOut = React.useCallback(() => {
-				const anim = POP_ANIMATIONS[Math.floor(Math.random() * POP_ANIMATIONS.length)];
-				setAnimClass(anim);
-				setTimeout(() => setAnimClass(""), 400);
-			}, []);
-
-			const beginDrag = (e) => {
-				if (e.button !== 0 && e.pointerType === "mouse") return;
-				e.preventDefault();
-				const rect = pillRef.current ? pillRef.current.getBoundingClientRect() : { left: pos.x, top: pos.y, width: 52, height: 52 };
-				dragRef.current = {
-					startX: e.clientX,
-					startY: e.clientY,
-					origLeft: rect.left,
-					origTop: rect.top,
-					moved: false
-				};
-				setDragging(true);
-				window.addEventListener("pointermove", onDragMove);
-				window.addEventListener("pointerup", onDragEnd);
-			};
-			const onDragMove = (e) => {
-				const d = dragRef.current;
-				if (!d) return;
-				const nx = d.origLeft + (e.clientX - d.startX);
-				const ny = d.origTop + (e.clientY - d.startY);
-				if (Math.abs(e.clientX - d.startX) + Math.abs(e.clientY - d.startY) > 3) d.moved = true;
-				setPos({ x: clamp(nx, -40, window.innerWidth - 20), y: clamp(ny, -40, window.innerHeight - 20) });
-			};
-			const onDragEnd = (e) => {
-				window.removeEventListener("pointermove", onDragMove);
-				window.removeEventListener("pointerup", onDragEnd);
-				setDragging(false);
-				const d = dragRef.current;
-				dragRef.current = null;
-				if (!d) return;
-				if (d.moved) movedRef.current = true;
-				const nx = clamp(d.origLeft + (e.clientX - d.startX), 0, window.innerWidth - 20);
-				const ny = clamp(d.origTop + (e.clientY - d.startY), 0, window.innerHeight - 20);
-				setPos({ x: nx, y: ny });
-				board.setFloat({ x: nx, y: ny });
-				if (d.moved) popOut();
-			};
-
-			const pillStyle = {
-				left: pos.x,
-				top: pos.y,
-				width: 52,
-				height: 52,
-				transform: "none"
-			};
-
-			const onPillClick = () => {
-				if (movedRef.current) {
-					movedRef.current = false;
-					return;
-				}
-				// 点击悬浮窗打开配置弹窗
-				setPanelOpen(true);
-			};
+				board.listSounds().then(setSounds).catch(() => setSounds([]));
+			}, [board]);
 
 			const addSituation = () => {
 				const label = newLabel.trim();
@@ -766,177 +719,146 @@ window.__ModuleLoader__.load({
 				setAdding(false);
 			};
 
-			const panel = panelOpen
-				? h("div", { className: "dsp-panel", style: panelStyle },
-					h("div", { className: "dsp-panel-head" },
-						h("span", { className: "dsp-panel-title" }, "🎵 音效播放器"),
-						h("button", { className: "dsp-close", onClick: () => setPanelOpen(false) }, "✕")
+			return h("div", { className: "dsp-settings" },
+				h("div", { className: "dsp-settings-head" }, "🎵 音效播放器"),
+				h("div", { className: "dsp-settings-sub" }, "在对话各阶段播放提示音（对话完成、权限请求、子代理完成等）。所有操作都在此设置页完成。"),
+				h("div", { className: "dsp-sec" },
+					h("div", { className: "dsp-sec-title" }, "总开关与音量"),
+					h("div", { className: "dsp-row" },
+						h("label", { className: "dsp-toggle" },
+							h("input", { type: "checkbox", checked: !!state.enabled, onChange: (e) => board.setEnabled(e.target.checked) }),
+							h("span", { className: "dsp-knob" })
+						),
+						h("span", { className: "dsp-label" }, "启用音效播放器"),
+						h("button", { className: "dsp-btn", onClick: () => board.stopAll() }, "停止")
 					),
-					h("div", { className: "dsp-panel-body" },
-						h("div", { className: "dsp-sec" },
-							h("div", { className: "dsp-sec-title" }, "总开关与音量"),
-							h("div", { className: "dsp-row" },
-								h("label", { className: "dsp-toggle" },
-									h("input", { type: "checkbox", checked: !!state.enabled, onChange: (e) => board.setEnabled(e.target.checked) }),
-									h("span", { className: "dsp-knob" })
-								),
-								h("span", { className: "dsp-label" }, "启用音效播放器"),
-								h("button", { className: "dsp-btn", onClick: () => board.stopAll() }, "停止")
-							),
-							h("div", { className: "dsp-row" },
-								h("span", { className: "dsp-label dsp-muted", style: { flex: "none" } }, "音量"),
-								h("input", { className: "dsp-range", type: "range", min: 0, max: 1, step: 0.05, value: state.volume, onChange: (e) => board.setVolume(Number(e.target.value)) }),
-								h("span", { className: "dsp-muted", style: { width: 36, textAlign: "right" } }, Math.round(state.volume * 100) + "%")
-							),
-							h("div", { className: "dsp-row" },
-								h("label", { className: "dsp-toggle" },
-									h("input", { type: "checkbox", checked: !!state.onlyCurrentSession, onChange: (e) => board.setOnlyCurrentSession(e.target.checked) }),
-									h("span", { className: "dsp-knob" })
-								),
-								h("span", { className: "dsp-label" }, "仅当前会话响铃")
-							)
+					h("div", { className: "dsp-row" },
+						h("span", { className: "dsp-label dsp-muted", style: { flex: "none" } }, "音量"),
+						h("input", { className: "dsp-range", type: "range", min: 0, max: 1, step: 0.05, value: state.volume, onChange: (e) => board.setVolume(Number(e.target.value)) }),
+						h("span", { className: "dsp-muted", style: { width: 36, textAlign: "right" } }, Math.round(state.volume * 100) + "%")
+					),
+					h("div", { className: "dsp-row" },
+						h("label", { className: "dsp-toggle" },
+							h("input", { type: "checkbox", checked: !!state.onlyCurrentSession, onChange: (e) => board.setOnlyCurrentSession(e.target.checked) }),
+							h("span", { className: "dsp-knob" })
 						),
-						h("div", { className: "dsp-sec" },
-							h("div", { className: "dsp-sec-title" }, "情况与音效绑定"),
-							h("div", { className: "dsp-scroll" },
-								state.situations.map((sit) => h(SituationRow, {
-									key: sit.id,
-									sit,
-									sounds,
-									onChange: (patch) => board.setSituation(sit.id, patch),
-									onRemove: () => board.removeSituation(sit.id),
-									onTest: () => board.triggerSituation(sit.id)
-								}))
-							),
-							h("div", { className: "dsp-row", style: { marginTop: 8 } },
-								!adding
-									? h("button", { className: "dsp-btn dsp-primary", onClick: () => setAdding(true) }, "＋ 增添情况检测项")
-									: null,
-								h("button", {
-									className: "dsp-btn",
-									title: "恢复为内置的 5 种默认情况（保留已导入音效）",
-									onClick: () => { if (confirm("恢复默认情况？自定义情况将被移除（已导入的音效保留）。")) board.resetSituations(); }
-								}, "恢复默认")
-							),
-							adding
-								? h("div", { className: "dsp-sec", style: { marginTop: 4 } },
-									h("div", { className: "dsp-row" },
-										h("input", { className: "dsp-input", style: { flex: 1 }, placeholder: "情况名称（如：任务完成）", value: newLabel, onChange: (e) => setNewLabel(e.target.value) })
-									),
-									h("div", { className: "dsp-row" },
-										h("span", { className: "dsp-label dsp-muted", style: { flex: "none" } }, "触发方式"),
-										h("select", { className: "dsp-select", value: newTrigger, onChange: (e) => setNewTrigger(e.target.value) },
-											Object.keys(TRIGGER_LABELS).map((k) => h("option", { key: k, value: k }, TRIGGER_LABELS[k]))
-										)
-									),
-									h("div", { className: "dsp-row" },
-										h("button", { className: "dsp-btn dsp-primary", onClick: addSituation }, "保存"),
-										h("button", { className: "dsp-btn", onClick: () => setAdding(false) }, "取消")
-									)
-								)
-								: null
-						),
-						h("div", { className: "dsp-sec" },
-							h("div", { className: "dsp-sec-title" }, "音效库（导入音频）"),
-							h("div", { className: "dsp-row" },
-								h("button", { className: "dsp-btn", onClick: () => fileRef.current && fileRef.current.click() }, "选择音频文件…"),
-								h("button", { className: "dsp-btn", onClick: () => dirRef.current && dirRef.current.click() }, "选择音频文件夹…")
-							),
-							h("input", {
-								ref: fileRef,
-								type: "file",
-								accept: "audio/*",
-								multiple: true,
-								style: { display: "none" },
-								onChange: (e) => {
-									const files = Array.from(e.target.files || []);
-									e.target.value = "";
-									if (files.length) board.importAudioFiles(files).then(() => board.listSounds()).then(setSounds);
-								}
-							}),
-							h("input", {
-								ref: dirRef,
-								type: "file",
-								webkitdirectory: "",
-								multiple: true,
-								style: { display: "none" },
-								onChange: (e) => {
-									const files = Array.from(e.target.files || []);
-									e.target.value = "";
-									if (files.length) board.importAudioDir(files).then(() => board.listSounds()).then(setSounds);
-								}
-							}),
-							h("div", {
-								className: "dsp-drop" + (dropOver ? " dsp-over" : ""),
-								onClick: () => fileRef.current && fileRef.current.click(),
-								onDragOver: (e) => { e.preventDefault(); setDropOver(true); },
-								onDragLeave: () => setDropOver(false),
-								onDrop: (e) => {
-									e.preventDefault();
-									setDropOver(false);
-									const files = Array.from(e.dataTransfer.files || []);
-									if (files.length) board.importAudioFiles(files).then(() => board.listSounds()).then(setSounds);
-								}
-							}, "把音频文件拖到这里，或点击选择"),
-							h("div", { className: "dsp-scroll", style: { marginTop: 8 } },
-								sounds.length === 0
-									? h("div", { className: "dsp-muted" }, "尚未导入任何音频")
-									: sounds.map((s) => h(SoundRow, {
-										key: s.id,
-										sound: s,
-										onTest: () => { engine.play(s); },
-										onDelete: () => board.deleteSound(s.id).then(() => board.listSounds()).then(setSounds)
-									}))
-							)
-						),
-						h("div", { className: "dsp-sec" },
-							h("div", { className: "dsp-sec-title" }, "插件 API（供其他插件调用）"),
-							h("div", { className: "dsp-hint" },
-								"其他插件可注入本插件（inject 加 \"dsh-sound-player\"）后通过 ctx.get(\"soundPlayer\") 调用：importAudioFile(file) / importAudioFiles(files) / importAudioDir(files) / addSituation({label, trigger}) / triggerSituation(id) / setSituation(id, patch) 等；也可直接使用 window.__dshSoundPlayer__。"
-							),
-							h("div", { className: "dsp-hint" }, "提示：浏览器自动播放策略要求先有任意一次鼠标/键盘交互，音效才会出声。")
-						)
+						h("span", { className: "dsp-label" }, "仅当前会话响铃")
 					)
-				)
-				: null;
-
-			return h(React.Fragment, null,
-				panel,
-				h("div", {
-					ref: pillRef,
-					className: "dsp-pill" + (dragging ? " dsp-dragging" : "") + (state.enabled ? " dsp-on" : "") + (animClass ? " " + animClass : ""),
-					style: pillStyle,
-					onPointerDown: beginDrag,
-					onClick: onPillClick,
-					title: state.enabled ? "音效播放器（点击打开配置）" : "音效播放器（已停用）"
-				},
-					h("span", { className: "dsp-pill-badge" }),
-					h(IconSpeaker)
+				),
+				h("div", { className: "dsp-sec" },
+					h("div", { className: "dsp-sec-title" }, "情况与音效绑定"),
+					h("div", { className: "dsp-scroll" },
+						state.situations.map((sit) => h(SituationRow, {
+							key: sit.id,
+							sit,
+							sounds,
+							onChange: (patch) => board.setSituation(sit.id, patch),
+							onRemove: () => board.removeSituation(sit.id),
+							onTest: () => board.triggerSituation(sit.id)
+						}))
+					),
+					h("div", { className: "dsp-row", style: { marginTop: 8 } },
+						!adding
+							? h("button", { className: "dsp-btn dsp-primary", onClick: () => setAdding(true) }, "＋ 增添情况检测项")
+							: null,
+						h("button", {
+							className: "dsp-btn",
+							title: "恢复为内置的 7 种默认情况（保留已导入音效）",
+							onClick: () => { if (confirm("恢复默认情况？自定义情况将被移除（已导入的音效保留）。")) board.resetSituations(); }
+						}, "恢复默认")
+					),
+					adding
+						? h("div", { className: "dsp-sec", style: { marginTop: 4 } },
+							h("div", { className: "dsp-row" },
+								h("input", { className: "dsp-input", style: { flex: 1 }, placeholder: "情况名称（如：任务完成）", value: newLabel, onChange: (e) => setNewLabel(e.target.value) })
+							),
+							h("div", { className: "dsp-row" },
+								h("span", { className: "dsp-label dsp-muted", style: { flex: "none" } }, "触发方式"),
+								h("select", { className: "dsp-select", value: newTrigger, onChange: (e) => setNewTrigger(e.target.value) },
+									Object.keys(TRIGGER_LABELS).map((k) => h("option", { key: k, value: k }, TRIGGER_LABELS[k]))
+								)
+							),
+							h("div", { className: "dsp-row" },
+								h("button", { className: "dsp-btn dsp-primary", onClick: addSituation }, "保存"),
+								h("button", { className: "dsp-btn", onClick: () => setAdding(false) }, "取消")
+							)
+						)
+						: null
+				),
+				h("div", { className: "dsp-sec" },
+					h("div", { className: "dsp-sec-title" }, "音效库（导入音频）"),
+					h("div", { className: "dsp-row" },
+						h("button", { className: "dsp-btn", onClick: () => fileRef.current && fileRef.current.click() }, "选择音频文件…"),
+						h("button", { className: "dsp-btn", onClick: () => dirRef.current && dirRef.current.click() }, "选择音频文件夹…")
+					),
+					h("input", {
+						ref: fileRef,
+						type: "file",
+						accept: "audio/*",
+						multiple: true,
+						style: { display: "none" },
+						onChange: (e) => {
+							const files = Array.from(e.target.files || []);
+							e.target.value = "";
+							if (files.length) board.importAudioFiles(files).then(() => board.listSounds()).then(setSounds);
+						}
+					}),
+					h("input", {
+						ref: dirRef,
+						type: "file",
+						webkitdirectory: "",
+						multiple: true,
+						style: { display: "none" },
+						onChange: (e) => {
+							const files = Array.from(e.target.files || []);
+							e.target.value = "";
+							if (files.length) board.importAudioDir(files).then(() => board.listSounds()).then(setSounds);
+						}
+					}),
+					h("div", {
+						className: "dsp-drop" + (dropOver ? " dsp-over" : ""),
+						onClick: () => fileRef.current && fileRef.current.click(),
+						onDragOver: (e) => { e.preventDefault(); setDropOver(true); },
+						onDragLeave: () => setDropOver(false),
+						onDrop: (e) => {
+							e.preventDefault();
+							setDropOver(false);
+							const files = Array.from(e.dataTransfer.files || []);
+							if (files.length) board.importAudioFiles(files).then(() => board.listSounds()).then(setSounds);
+						}
+					}, "把音频文件拖到这里，或点击选择"),
+					h("div", { className: "dsp-scroll", style: { marginTop: 8 } },
+						sounds.length === 0
+							? h("div", { className: "dsp-muted" }, "尚未导入任何音频")
+							: sounds.map((s) => h(SoundRow, {
+								key: s.id,
+								sound: s,
+								onTest: () => { engine.play(s); },
+								onDelete: () => board.deleteSound(s.id).then(() => board.listSounds()).then(setSounds)
+							}))
+					)
+				),
+				h("div", { className: "dsp-sec" },
+					h("div", { className: "dsp-sec-title" }, "插件 API（供其他插件调用）"),
+					h("div", { className: "dsp-hint" },
+						"其他插件可注入本插件（inject 加 \"dsh-sound-player\"）后通过 ctx.get(\"soundPlayer\") 调用：importAudioFile(file) / importAudioFiles(files) / importAudioDir(files) / addSituation({label, trigger}) / triggerSituation(id) / setSituation(id, patch) 等；也可直接使用 window.__dshSoundPlayer__。"
+					),
+					h("div", { className: "dsp-hint" }, "提示：浏览器自动播放策略要求先有任意一次鼠标/键盘交互，音效才会出声。")
 				)
 			);
 		}
 
-		function mountUI(board) {
+		function registerSettings(ctx) {
 			ensureStyle();
-			let container = document.getElementById("dsh-sound-player-root");
-			if (!container) {
-				container = document.createElement("div");
-				container.id = "dsh-sound-player-root";
-				document.body.appendChild(container);
-			}
-			let root;
-			try {
-				root = ReactDOM.createRoot(container);
-			} catch (err) {
-				root = null;
-			}
-			if (!root) return null;
-			root.render(h(App, { board }));
-			const unmount = () => {
-				try { root.unmount(); } catch (err) { /* */ }
-				try { if (container && container.parentNode) container.parentNode.removeChild(container); } catch (err) { /* */ }
-			};
-			return unmount;
+			// 注册到 DSH 设置菜单：设置 → 音效播放器
+			const dispose = ctx.slots.inject("settings.section", () => ctx.slots.register({
+				name: "settings.section",
+				id: "sound-player",
+				order: 30,
+				label: () => "🎵 音效播放器",
+				inject: () => ({ board: soundPlayer })
+			}, App));
+			return () => { try { dispose(); } catch (err) { /* */ } };
 		}
 		// #endregion
 
@@ -959,10 +881,22 @@ window.__ModuleLoader__.load({
 			} catch (err) {
 				console.warn("[dsh-sound-player] 事件监听启动失败", err);
 			}
-			const unmount = mountUI(soundPlayer);
+			let disposeSubagent = null;
+			try {
+				disposeSubagent = startSubagentWatcher(sessions);
+			} catch (err) {
+				console.warn("[dsh-sound-player] 子代理监听启动失败", err);
+			}
+			let disposeSettings = null;
+			try {
+				disposeSettings = registerSettings(ctx);
+			} catch (err) {
+				console.warn("[dsh-sound-player] 设置页注册失败", err);
+			}
 			const dispose = () => {
 				try { if (disposeWatchers) disposeWatchers(); } catch (err) { /* */ }
-				try { if (unmount) unmount(); } catch (err) { /* */ }
+				try { if (disposeSubagent) disposeSubagent(); } catch (err) { /* */ }
+				try { if (disposeSettings) disposeSettings(); } catch (err) { /* */ }
 			};
 			try {
 				ctx.on("dispose", dispose);
@@ -972,7 +906,7 @@ window.__ModuleLoader__.load({
 		}
 		// #endregion
 
-		exports.inject = ["connection", "sessions"];
+		exports.inject = ["connection", "sessions", "slots"];
 		exports.apply = apply;
 		return module.exports;
 	}
