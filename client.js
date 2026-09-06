@@ -366,70 +366,140 @@ window.__ModuleLoader__.load({
 		}
 		// #endregion
 
-		// #region 事件监听（订阅运行时信封流，只读不干扰；不额外开 mux 流，避免重复分发）
-		function startWatchers(connection) {
-			const api = connection && connection.api ? connection.api : null;
-			let streamLost = false;
+		// #region 事件监听（0.1.2-rc.1 新架构：remote 广播 + pendingInteractions 快照 + 逐会话 eventSource）
+		// 旧版通过 connection.api.subscribeEnvelopes 订阅 mux 信封流，该 API 在 0.1.2-rc.1 已移除
+		// （connection 不再有 .api / .hostDescription），改为订阅三个官方事件源：
+		//   1) ctx.remote.$on("api-session/status")  —— 全会话回合结束（running 翻转边沿）
+		//   2) ctx.uiSession.pendingInteractions     —— 权限请求 / 被提问（含计划评审）
+		//   3) sessions.binding(id).eventSource      —— 逐会话 user/message（append 流）
+		//   4) connection.state                      —— 服务终止（connected -> disconnected）
+		function startWatchers(deps) {
+			const connection = deps && deps.connection ? deps.connection : null;
+			const remote = deps && deps.remote ? deps.remote : null;
+			const uiSession = deps && deps.uiSession ? deps.uiSession : null;
+			const unsubs = [];
+			const safeUnsub = (fn) => { try { if (typeof fn === "function") fn(); } catch (err) { /* */ } };
 			let lastStopPlay = 0;
 			const maybeServiceStop = () => {
-				if (streamLost) return;
-				streamLost = true;
 				const now = Date.now();
 				if (now - lastStopPlay < 5000) return;
 				lastStopPlay = now;
 				triggerByEvent("stream-end");
 			};
-			// 每条信封是 { rpcId, payload }，帧内容在 payload（MuxFrame / HostFrame）
-			const handleEnvelope = (envelope) => {
-				if (!envelope || typeof envelope !== "object") return;
-				const f = envelope.payload;
-				if (!f || typeof f !== "object" || typeof f.type !== "string") return;
-				switch (f.type) {
-					case "session/event": {
-						const ev = f.event;
-						if (!ev || typeof ev !== "object") break;
-						if (ev.type === "turn/end") {
-							triggerByEvent("turn-end", f.sessionId);
-						} else if (ev.type === "user/message" && ev.data && ev.data.source && ev.data.source.kind === "user") {
-							triggerByEvent("user-message", f.sessionId);
-						}
-						break;
-					}
-					case "approval/requested":
-						triggerByEvent("approval-requested", f.sessionId);
-						break;
-					case "question/requested":
-						triggerByEvent("question-requested", f.sessionId);
-						break;
-					case "stream/error":
-						maybeServiceStop();
-						break;
-					default:
-						break;
-				}
-			};
-			let unsubscribe = null;
-			if (api && typeof api.subscribeEnvelopes === "function") {
-				unsubscribe = api.subscribeEnvelopes((batch) => {
-					if (!Array.isArray(batch)) return;
-					for (const envelope of batch) handleEnvelope(envelope);
-				});
-			}
-			// 服务终止：连接快照消失（断开）时触发一次，带防抖
-			let hostUnsub = null;
-			try {
-				const hd = connection && connection.hostDescription;
-				if (hd && typeof hd.subscribe === "function") {
-					hostUnsub = hd.subscribe(() => {
-						if (!hd.getSnapshot()) maybeServiceStop();
+			// 1) 回合结束（全部会话）：remote emit 事件 "api-session/status"，回调 (sessionId, running)。
+			//    running true -> false 边沿即回合结束；初始化时首次快照不算边沿。
+			if (remote && typeof remote.$on === "function") {
+				try {
+					const prevRunning = new Map();
+					const off = remote.$on("api-session/status", (sessionId, running) => {
+						try {
+							const prev = prevRunning.get(sessionId);
+							prevRunning.set(sessionId, running);
+							if (prev === true && running === false) triggerByEvent("turn-end", sessionId);
+						} catch (err) { /* */ }
 					});
-				}
-			} catch (err) {
-				/* 忽略 */
+					if (typeof off === "function") unsubs.push(off);
+				} catch (err) { /* */ }
+			}
+			// 2) 权限请求 / 被提问：uiSession.pendingInteractions（root 级快照 store）。
+			//    快照为 Map<sessionId, interaction>；interaction.kind: "approval" | "question" | "plan-review"。
+			//    新出现的 pending 触发音效；消失（用户已处理）不触发。
+			if (uiSession && uiSession.pendingInteractions && typeof uiSession.pendingInteractions.subscribe === "function") {
+				try {
+					const store = uiSession.pendingInteractions;
+					const snapNow = () => {
+						const s = typeof store.getSnapshot === "function" ? store.getSnapshot() : null;
+						return s instanceof Map ? s : null;
+					};
+					let prevMap = new Map();
+					const init = snapNow();
+					if (init) prevMap = new Map(init);
+					const unsub = store.subscribe(() => {
+						try {
+							const snap = snapNow();
+							if (!snap) return;
+							for (const [sid, it] of snap) {
+								if (!it || typeof it !== "object" || prevMap.has(sid)) continue;
+								if (it.kind === "approval") triggerByEvent("approval-requested", sid);
+								else if (it.kind === "question" || it.kind === "plan-review") triggerByEvent("question-requested", sid);
+							}
+							prevMap = new Map(snap);
+						} catch (err) { /* */ }
+					});
+					if (typeof unsub === "function") unsubs.push(unsub);
+				} catch (err) { /* */ }
+			}
+			// 3) 发送消息（user/message）：逐会话 eventSource（sessions.binding(id).eventSource）。
+			//    只认 change.kind === "append" 的活事件（replace/prepend 是历史加载，忽略）。
+			//    订阅当前列表内全部会话，列表增删时 diff 维护（等价旧版全局信封流覆盖面）。
+			if (sessions && typeof sessions.binding === "function" && sessions.list && typeof sessions.list.subscribe === "function") {
+				try {
+					const evtUnsubs = new Map(); // sessionId -> unsub
+					const lastUserPlay = new Map(); // sessionId -> ts，防抖
+					const watchSession = (sid) => {
+						if (!sid || evtUnsubs.has(sid)) return;
+						try {
+							const binding = sessions.binding(sid);
+							const es = binding && binding.eventSource;
+							if (!es || typeof es.subscribe !== "function") return;
+							const onEvent = (arg) => {
+								try {
+									const snap = (arg && arg.change) ? arg : (typeof es.getSnapshot === "function" ? es.getSnapshot() : null);
+									const ch = snap && snap.change;
+									if (!ch || ch.kind !== "append" || !Array.isArray(ch.entries)) return;
+									let hit = false;
+									for (const entry of ch.entries) {
+										// 0.1.2-rc.1 的 entry 为 { type: "event", event: SessionEvent } 信封；
+										// 兼容旧版裸 SessionEvent 形状（entry.type === "user/message"）。
+										const ev = entry && entry.event ? entry.event : entry;
+										if (ev && ev.type === "user/message" && ev.data && ev.data.source && ev.data.source.kind === "user") { hit = true; break; }
+									}
+									if (hit) {
+										const now = Date.now();
+										if (now - (lastUserPlay.get(sid) || 0) < 500) return;
+										lastUserPlay.set(sid, now);
+										triggerByEvent("user-message", sid);
+									}
+								} catch (err) { /* */ }
+							};
+							const off = es.subscribe(onEvent);
+							if (typeof off === "function") evtUnsubs.set(sid, off);
+						} catch (err) { /* binding 对不可用会话可能抛错，忽略 */ }
+					};
+					const syncAll = () => {
+						try {
+							const st = sessions.list.getSnapshot ? sessions.list.getSnapshot() : null;
+							const ids = st && Array.isArray(st.ids) ? st.ids : [];
+							const idSet = new Set(ids);
+							for (const sid of ids) watchSession(sid);
+							for (const [sid, off] of Array.from(evtUnsubs)) {
+								if (!idSet.has(sid)) { safeUnsub(off); evtUnsubs.delete(sid); lastUserPlay.delete(sid); }
+							}
+						} catch (err) { /* */ }
+					};
+					syncAll();
+					const offList = sessions.list.subscribe(() => { try { syncAll(); } catch (err) { /* */ } });
+					if (typeof offList === "function") unsubs.push(offList);
+					unsubs.push(() => { for (const off of evtUnsubs.values()) safeUnsub(off); evtUnsubs.clear(); });
+				} catch (err) { /* */ }
+			}
+			// 4) 服务终止：connection.state "connected" -> "disconnected" 边沿（带防抖）。
+			//    等价旧版 hostDescription.getSnapshot() 消失检测。
+			if (connection && connection.state && typeof connection.state.subscribe === "function") {
+				try {
+					let prevState = typeof connection.state.getSnapshot === "function" ? connection.state.getSnapshot() : undefined;
+					const unsub = connection.state.subscribe((next) => {
+						try {
+							const st = typeof next === "string" ? next : (typeof connection.state.getSnapshot === "function" ? connection.state.getSnapshot() : undefined);
+							if (prevState === "connected" && st === "disconnected") maybeServiceStop();
+							prevState = st;
+						} catch (err) { /* */ }
+					});
+					if (typeof unsub === "function") unsubs.push(unsub);
+				} catch (err) { /* */ }
 			}
 			return () => {
-				try { if (unsubscribe) unsubscribe(); } catch (err) { /* */ }
-				try { if (hostUnsub) hostUnsub(); } catch (err) { /* */ }
+				for (const fn of unsubs.splice(0)) safeUnsub(fn);
 			};
 		}
 
@@ -878,7 +948,9 @@ window.__ModuleLoader__.load({
 			let disposeWatchers = null;
 			try {
 				const connection = ctx.get("connection");
-				if (connection && connection.api) disposeWatchers = startWatchers(connection);
+				const remote = ctx.remote || null;
+				const uiSession = ctx.uiSession || null;
+				disposeWatchers = startWatchers({ connection: connection, remote: remote, uiSession: uiSession });
 			} catch (err) {
 				console.warn("[dsh-sound-player] 事件监听启动失败", err);
 			}
@@ -907,7 +979,7 @@ window.__ModuleLoader__.load({
 		}
 		// #endregion
 
-		exports.inject = ["connection", "sessions", "slots"];
+		exports.inject = ["connection", "sessions", "remote", "uiSession", "slots"];
 		exports.apply = apply;
 		return module.exports;
 	}
