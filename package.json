@@ -1,7 +1,7 @@
 {
   "name": "dsh-sound-player",
   "description": "DSH Web 音效播放器：全部操作集成于设置菜单（设置 → 音效播放器）。为对话完成、发送消息、权限请求、被提问、服务终止、子代理运行完成、最后一个子代理运行完成等 7 类情况播放提示音；内置 Web Audio 合成音效与 Windows 系统提示音，支持导入自定义音频并逐情况绑定、开关与试听；提供 soundPlayer 服务（window.__dshSoundPlayer__）供其他插件调用。",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -26,7 +26,10 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-connection",
-        "@deepseek-ai/dsh-client-runtime"
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-ui-renderer"
       ]
     }
   },
