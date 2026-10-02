@@ -1,9 +1,13 @@
-# dsh-sound-player — DSH Web 音效播放器
+# dsh-sound-player — DSH 桌面端音效播放器
 
-为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) Web GUI 开发的**音效播放器**插件，
-所有操作都集成在**设置菜单**中（设置 → 音效播放器）。发布为 DSH 客户端插件（`dsh.client`），支持 GitHub / npm / tarball 分发。
+为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) **桌面端**开发的**音效播放器**插件：
+所有操作都集成在**设置菜单**中（设置 → 音效播放器），**没有悬浮窗、没有第二个入口**。
+发布为 DSH 客户端插件（`dsh.client`），支持 GitHub / npm / tarball 分发。
 
 > 本插件是「音效播放器」，在用户进行对话时，可以在各种阶段（对话终止，请求权限，子代理完成等）发出提示音，提醒用户处理相应状况。
+>
+> **维护范围**：只针对**正版 DSH 桌面端**更新，对接桌面端内置的客户端插件契约
+> （`ctx.sessions` / `ctx.remote` / `settings.section` 槽位），不为其他宿主或旧版网页端做兼容。
 
 ## 功能
 
@@ -95,7 +99,7 @@ dsh plugin add ./dsh-sound-player-0.2.0.tgz
       name: dsh-sound-player
 ```
 
-之后无需改动任何官方文件，**重启 dsh web 服务**并刷新浏览器页面，即可在设置菜单看到「音效播放器」。
+之后无需改动任何官方文件，**重启 DSH 桌面端**并刷新页面，即可在设置菜单看到「音效播放器」。
 
 ## 在 dshfind.com 上被发现
 
@@ -104,10 +108,11 @@ dsh plugin add ./dsh-sound-player-0.2.0.tgz
 
 ## 结构
 
-- `package.json` — 声明 `dsh.client`（platform: web）与 `dsh.bundle`（自注册行）
+- `package.json` — 声明 `dsh.client`（`platform: "web"`，桌面端加载的就是这套客户端 bundle，不是分发渠道）与 `dsh.bundle`（自注册行）
 - `cordis.patch.yml` — 注册本插件的宿主端行（plugin row）
 - `lib/index.js` — 宿主端（Node half）占位
-- `client.js` — 浏览器端全部功能（存储 / 音效引擎 / 事件监听 / API / 设置页 UI）
+- `client.js` — 客户端全部功能（存储 / 音效引擎 / 事件监听 / API / 设置页 UI），随桌面端渲染进程运行；无悬浮窗
+- `test/event-chain.cjs` — 无头自检：桩化客户端运行时，断言 7 类触发是否真的接通
 
 ## 客户端前置（inject）
 
@@ -117,10 +122,10 @@ dsh plugin add ./dsh-sound-player-0.2.0.tgz
 
 ## 注意事项
 
-- 浏览器自动播放策略：需要页面有过一次鼠标/键盘交互后音效才会出声（插件会在
-  首次交互时自动恢复 AudioContext）。
-- 音频数据保存在浏览器 IndexedDB（`dsh-sound-player` 库），配置保存在 localStorage，
-  均只对本浏览器生效；清浏览器数据会清掉音效库。
+- 自动播放策略（桌面端渲染进程沿用 Chromium 策略）：需要界面有过一次鼠标/键盘交互后
+  音效才会出声，插件会在首次交互时自动恢复 AudioContext。
+- 音频数据保存在 IndexedDB（`dsh-sound-player` 库），配置保存在 localStorage，
+  均只对本机这份桌面端数据生效；清除客户端站点数据会清掉音效库。
 - 「服务终止」在连接代际消失（`generation` → `undefined`）或连接状态进入
   `disconnected` 时播放一次，带 5 秒防抖，避免重连抖动重复响。
 - 「子代理运行完成」通过 `sessions.list` 快照中 `origin === "subagent"` 行的
@@ -129,8 +134,8 @@ dsh plugin add ./dsh-sound-player-0.2.0.tgz
   与 `parentId` 两种命名。
 - `sessions.list` 与 `connection.generation` 属于客户端运行时的内部快照存储，
   未出现在官方客户端服务契约（cordis-inspect 目录）里。插件对它们的读取都做了
-  判空与 `try/catch`：接口缺失时静默降级，不影响其他功能。升级 DSH 后建议重跑
-  仓库外的事件链自检脚本确认契约未变。
+  判空与 `try/catch`：接口缺失时静默降级，不影响其他功能。桌面端升级后建议重跑
+  `test/event-chain.cjs` 确认契约未变。
 
 ## 已知问题
 

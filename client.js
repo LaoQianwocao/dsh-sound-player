@@ -151,7 +151,6 @@ window.__ModuleLoader__.load({
 						if (exist.audioId == null && def.audioId) exist.audioId = def.audioId; // 迁移：老配置自动补默认音效
 					}
 				}
-				delete cfg.float; // 迁移：悬浮窗已迁移至设置菜单，不再需要位置配置
 				return cfg;
 			} catch (err) {
 				return base;
