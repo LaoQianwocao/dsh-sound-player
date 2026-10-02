@@ -333,13 +333,46 @@ window.__ModuleLoader__.load({
 
 		// #region 触发逻辑
 		let sessions = null;
-		function currentSessionId() {
+		// 会话列表快照形如 { byId: { [sessionId]: row }, phase }，**没有 `current` 字段**；
+		// DSH 客户端判定「当前会话」的约定是 retainedBy.mainView > 0 的那一行
+		// （主视图正在保留它，见 ui-workspace 的实现）。
+		function sessionListSnapshot() {
 			try {
-				const st = sessions && sessions.list && sessions.list.getSnapshot ? sessions.list.getSnapshot() : null;
-				return st ? st.current : undefined;
+				const store = sessions && sessions.list;
+				return store && typeof store.getSnapshot === "function" ? store.getSnapshot() : null;
 			} catch (err) {
-				return undefined;
+				return null;
 			}
+		}
+		function retainedByMainView(row) {
+			return !!(row && row.retainedBy && (row.retainedBy.mainView || 0) > 0);
+		}
+		function currentSessionId() {
+			const st = sessionListSnapshot();
+			if (!st || !st.byId) return undefined;
+			for (const id of Object.keys(st.byId)) {
+				if (retainedByMainView(st.byId[id])) return id;
+			}
+			return undefined;
+		}
+		// 子代理行：origin === "subagent"；父会话字段在不同版本里可能是
+		// parentSessionId（Host 摘要）或 parentId，两个都认。
+		function parentSessionOf(row) {
+			if (!row) return undefined;
+			return row.parentSessionId !== undefined ? row.parentSessionId : row.parentId;
+		}
+		function isSubagentRow(row) {
+			return !!row && (row.origin === "subagent" || (row.origin === undefined && parentSessionOf(row) !== undefined));
+		}
+		// 被提问有两条信号：宿主转发的 waterfall 事件 user-questions/request，
+		// 以及会话事件流里的 ask_user_question 工具调用。两条路径共用这个防抖，
+		// 保证同一次提问只响一声。
+		let lastQuestionPlay = 0;
+		function triggerQuestionOnce(sessionId) {
+			const now = Date.now();
+			if (now - lastQuestionPlay < 1500) return;
+			lastQuestionPlay = now;
+			triggerByEvent("question-requested", sessionId);
 		}
 		function situationByTrigger(trigger) {
 			if (!config.enabled) return null;
@@ -366,70 +399,148 @@ window.__ModuleLoader__.load({
 		}
 		// #endregion
 
-		// #region 事件监听（订阅运行时信封流，只读不干扰；不额外开 mux 流，避免重复分发）
-		function startWatchers(connection) {
-			const api = connection && connection.api ? connection.api : null;
-			let streamLost = false;
+		// #region 事件监听（订阅当前会话的实时事件窗口，只读不干扰）
+		// DSH 客户端运行时已用 `sessions` 服务（SessionController）取代旧的
+		// connection.api.subscribeEnvelopes 信封流；会话事件改为在
+		// `sessions.binding(id).eventSource` 的窗口里持续追加。这里订阅当前会话
+		// 的 eventSource，按事件类型映射到内置触发器。
+		function startSessionWatcher(sessions, connection) {
+			let currentId;
+			let attachedId = null; // null = 尚未附着；会话 id 是字符串，不会与 null 冲突
+			let unbindEvent = null;
+			let lastSeenSeq = -1;
+			let hadGeneration = false;
 			let lastStopPlay = 0;
+			let lastConnState;
+
+			const mapEvent = (ev) => {
+				if (!ev || typeof ev !== "object" || typeof ev.type !== "string") return;
+				switch (ev.type) {
+					case "turn/end":
+						triggerByEvent("turn-end", currentId);
+						break;
+					case "user/message":
+						if (ev.data && ev.data.source && ev.data.source.kind === "user") triggerByEvent("user-message", currentId);
+						break;
+					case "approval/asked":
+						triggerByEvent("approval-requested", currentId);
+						break;
+					case "tool/call":
+						// 被提问的底层信号（兜底）：模型调用 ask_user_question 工具。
+						if (ev.data && ev.data.name === "ask_user_question") triggerQuestionOnce(currentId);
+						break;
+				}
+			};
+
+			// 窗口变化：replace/prepend 是历史回填，仅更新基线 seq；append 是实时事件，才触发音效。
+			const scanChange = (change) => {
+				if (!change) return;
+				const entries = change.entries || [];
+				if (change.kind === "append") {
+					let max = lastSeenSeq;
+					for (const e of entries) {
+						const ev = e && e.event;
+						if (!ev || typeof ev.seq !== "number" || ev.seq <= lastSeenSeq) continue;
+						if (ev.seq > max) max = ev.seq;
+						mapEvent(ev);
+					}
+					lastSeenSeq = Math.max(lastSeenSeq, max);
+				} else if (change.kind === "replace" || change.kind === "prepend") {
+					let max = lastSeenSeq;
+					for (const e of entries) {
+						if (e && e.event && typeof e.event.seq === "number" && e.event.seq > max) max = e.event.seq;
+					}
+					lastSeenSeq = Math.max(lastSeenSeq, max);
+				}
+			};
+
+			const detach = () => {
+				if (unbindEvent) {
+					try { unbindEvent(); } catch (err) { /* */ }
+					unbindEvent = null;
+				}
+			};
+
+			const attach = () => {
+				const id = currentSessionId();
+				// 会话没变且订阅仍然有效时不重建；上次没订阅成功（例如当时还没有
+				// 实时窗口）则重试。
+				if (id === attachedId && unbindEvent) return;
+				detach();
+				currentId = id;
+				attachedId = id;
+				lastSeenSeq = -1;
+				if (id === undefined || !sessions || typeof sessions.binding !== "function") return;
+				let binding = null;
+				try { binding = sessions.binding(id); } catch (err) { return; }
+				if (!binding || !binding.eventSource) return; // 未被保留的会话没有实时事件窗口
+				const es = binding.eventSource;
+				// 基线：订阅前先记录窗口已有的最大 seq，避免回放历史事件触发音效。
+				try {
+					const s = es.getSnapshot();
+					if (s && s.entries) {
+						let max = -1;
+						for (const e of s.entries) {
+							if (e && e.event && typeof e.event.seq === "number" && e.event.seq > max) max = e.event.seq;
+						}
+						lastSeenSeq = max;
+					}
+				} catch (err) { /* 忽略 */ }
+				try {
+					unbindEvent = es.subscribe(() => {
+						let s = null;
+						try { s = es.getSnapshot(); } catch (err) { return; }
+						if (s && s.change) scanChange(s.change);
+					});
+				} catch (err) { /* 忽略 */ }
+			};
+
+			let listUnsub = null;
+			try {
+				if (sessions && sessions.list && typeof sessions.list.subscribe === "function") {
+					listUnsub = sessions.list.subscribe(attach);
+				}
+			} catch (err) { /* 忽略 */ }
+
+			// 服务终止：连接代际（generation）从有到无，或连接状态进入 disconnected，
+			// 都代表链路断开。两条信号共用 5 秒防抖，避免重连抖动重复响。
 			const maybeServiceStop = () => {
-				if (streamLost) return;
-				streamLost = true;
 				const now = Date.now();
 				if (now - lastStopPlay < 5000) return;
 				lastStopPlay = now;
 				triggerByEvent("stream-end");
 			};
-			// 每条信封是 { rpcId, payload }，帧内容在 payload（MuxFrame / HostFrame）
-			const handleEnvelope = (envelope) => {
-				if (!envelope || typeof envelope !== "object") return;
-				const f = envelope.payload;
-				if (!f || typeof f !== "object" || typeof f.type !== "string") return;
-				switch (f.type) {
-					case "session/event": {
-						const ev = f.event;
-						if (!ev || typeof ev !== "object") break;
-						if (ev.type === "turn/end") {
-							triggerByEvent("turn-end", f.sessionId);
-						} else if (ev.type === "user/message" && ev.data && ev.data.source && ev.data.source.kind === "user") {
-							triggerByEvent("user-message", f.sessionId);
-						}
-						break;
-					}
-					case "approval/requested":
-						triggerByEvent("approval-requested", f.sessionId);
-						break;
-					case "question/requested":
-						triggerByEvent("question-requested", f.sessionId);
-						break;
-					case "stream/error":
-						maybeServiceStop();
-						break;
-					default:
-						break;
-				}
-			};
-			let unsubscribe = null;
-			if (api && typeof api.subscribeEnvelopes === "function") {
-				unsubscribe = api.subscribeEnvelopes((batch) => {
-					if (!Array.isArray(batch)) return;
-					for (const envelope of batch) handleEnvelope(envelope);
-				});
-			}
-			// 服务终止：连接快照消失（断开）时触发一次，带防抖
-			let hostUnsub = null;
+			let genUnsub = null;
 			try {
-				const hd = connection && connection.hostDescription;
-				if (hd && typeof hd.subscribe === "function") {
-					hostUnsub = hd.subscribe(() => {
-						if (!hd.getSnapshot()) maybeServiceStop();
+				const gen = connection && connection.generation;
+				if (gen && typeof gen.subscribe === "function") {
+					hadGeneration = gen.getSnapshot() !== undefined;
+					genUnsub = gen.subscribe(() => {
+						const g = gen.getSnapshot();
+						if (hadGeneration && g === undefined) maybeServiceStop();
+						hadGeneration = g !== undefined;
 					});
 				}
-			} catch (err) {
-				/* 忽略 */
-			}
+			} catch (err) { /* 忽略 */ }
+			let stateUnsub = null;
+			try {
+				const stateSrc = connection && connection.state;
+				if (stateSrc && typeof stateSrc.subscribe === "function") {
+					lastConnState = stateSrc.getSnapshot();
+					stateUnsub = stateSrc.subscribe(() => {
+						const s = stateSrc.getSnapshot();
+						if (lastConnState === "connected" && s === "disconnected") maybeServiceStop();
+						lastConnState = s;
+					});
+				}
+			} catch (err) { /* 忽略 */ }
+
+			attach();
 			return () => {
-				try { if (unsubscribe) unsubscribe(); } catch (err) { /* */ }
-				try { if (hostUnsub) hostUnsub(); } catch (err) { /* */ }
+				try { if (listUnsub) listUnsub(); } catch (err) { /* */ }
+				try { if (genUnsub) genUnsub(); } catch (err) { /* */ }
+				try { if (stateUnsub) stateUnsub(); } catch (err) { /* */ }
+				detach();
 			};
 		}
 
@@ -437,9 +548,9 @@ window.__ModuleLoader__.load({
 		// - subagent-complete：任意子代理从运行中变为完成
 		// - last-subagent-complete：当前会话树内所有运行中的子代理全部完成（一轮"波"结束）
 		function startSubagentWatcher(sessions) {
-			const seen = new Map(); // subagentId -> { parentId, wasRunning }
+			const seen = new Map(); // subagentId -> { wasRunning }
 			let waveRunning = false; // 当前是否存在运行中的子代理
-			let lastCurrent = undefined;
+			let lastCurrent;
 			let unsub = null;
 			try {
 				const list = sessions && sessions.list;
@@ -448,18 +559,19 @@ window.__ModuleLoader__.load({
 					let cur = candidateId;
 					let hops = 0;
 					while (cur !== undefined && cur !== ancestorId && hops < 32) {
-						const s = byId[cur];
-						if (!s || s.origin !== "subagent" || s.parentId === undefined) return false;
-						cur = s.parentId;
+						const row = byId[cur];
+						if (!isSubagentRow(row)) return false;
+						const parent = parentSessionOf(row);
+						if (parent === undefined) return false;
+						cur = parent;
 						hops += 1;
 					}
 					return cur === ancestorId;
 				};
 				unsub = list.subscribe(() => {
-					let st;
-					try { st = list.getSnapshot(); } catch (err) { return; }
+					const st = sessionListSnapshot();
 					if (!st || !st.byId) return;
-					const current = st.current;
+					const current = currentSessionId();
 					if (current !== lastCurrent) {
 						// 切换会话：重置跟踪状态，避免串音
 						lastCurrent = current;
@@ -467,24 +579,25 @@ window.__ModuleLoader__.load({
 						waveRunning = false;
 					}
 					const runningNow = [];
-					for (const [id, sum] of Object.entries(st.byId)) {
-						if (!sum || sum.origin !== "subagent") continue;
-						if (current !== undefined && sum.parentId !== undefined && !isDescendantOf(id, current, st.byId)) continue;
-						if (sum.running) runningNow.push(id);
+					for (const [id, row] of Object.entries(st.byId)) {
+						if (!isSubagentRow(row)) continue;
+						const parent = parentSessionOf(row);
+						if (current !== undefined && parent !== undefined && !isDescendantOf(id, current, st.byId)) continue;
+						if (row.running) runningNow.push(id);
 					}
 					// 检测完成翻转（running: true -> false）
 					for (const [id, rec] of seen) {
-						const sum = st.byId[id];
-						if (sum === undefined) { seen.delete(id); continue; }
-						if (rec.wasRunning && !sum.running) {
+						const row = st.byId[id];
+						if (row === undefined) { seen.delete(id); continue; }
+						if (rec.wasRunning && !row.running) {
 							triggerByEvent("subagent-complete", current);
 						}
-						rec.wasRunning = sum.running;
+						rec.wasRunning = !!row.running;
 					}
 					for (const id of runningNow) {
 						const rec = seen.get(id);
 						if (rec) rec.wasRunning = true;
-						else seen.set(id, { parentId: st.byId[id].parentId, wasRunning: true });
+						else seen.set(id, { wasRunning: true });
 					}
 					// 波检测：从"有运行中的子代理"变为"无" → 最后一个完成
 					const prevWave = waveRunning;
@@ -878,7 +991,7 @@ window.__ModuleLoader__.load({
 			let disposeWatchers = null;
 			try {
 				const connection = ctx.get("connection");
-				if (connection && connection.api) disposeWatchers = startWatchers(connection);
+				disposeWatchers = startSessionWatcher(sessions, connection);
 			} catch (err) {
 				console.warn("[dsh-sound-player] 事件监听启动失败", err);
 			}
@@ -887,6 +1000,22 @@ window.__ModuleLoader__.load({
 				disposeSubagent = startSubagentWatcher(sessions);
 			} catch (err) {
 				console.warn("[dsh-sound-player] 子代理监听启动失败", err);
+			}
+			// 被提问：user-questions/request 是宿主转发的 waterfall 事件，插件只旁听，
+			// 必须把请求交还给真正的应答者（return next()），否则会截断提问链路。
+			let disposeQuestions = null;
+			try {
+				const remote = ctx.remote;
+				if (remote && typeof remote.$on === "function") {
+					disposeQuestions = remote.$on("user-questions/request", (request, next) => {
+						let sid;
+						try { sid = request && request.agent ? request.agent.id : undefined; } catch (err) { sid = undefined; }
+						triggerQuestionOnce(sid === undefined ? currentSessionId() : sid);
+						return typeof next === "function" ? next() : undefined;
+					});
+				}
+			} catch (err) {
+				console.warn("[dsh-sound-player] 提问监听启动失败", err);
 			}
 			let disposeSettings = null;
 			try {
@@ -897,6 +1026,7 @@ window.__ModuleLoader__.load({
 			const dispose = () => {
 				try { if (disposeWatchers) disposeWatchers(); } catch (err) { /* */ }
 				try { if (disposeSubagent) disposeSubagent(); } catch (err) { /* */ }
+				try { if (typeof disposeQuestions === "function") disposeQuestions(); } catch (err) { /* */ }
 				try { if (disposeSettings) disposeSettings(); } catch (err) { /* */ }
 			};
 			try {

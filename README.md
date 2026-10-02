@@ -50,6 +50,21 @@
 自定义 trigger 值传给 `addSituation` 后，需由插件自己在合适的时机调用
 `triggerSituation(id)` 播放（框架只识别上面列出的内置 trigger 事件）。
 
+## 触发信号来源（与当前 DSH 客户端运行时对齐）
+
+插件只订阅客户端插件契约，不依赖私有构建产物：
+
+| trigger | 信号来源 |
+| --- | --- |
+| `turn-end` / `user-message` / `approval-requested` | 当前会话的实时事件窗口 `sessions.binding(id).eventSource`：只处理 `append` 增量，订阅前用窗口最大 `seq` 建基线，避免回放历史事件响铃 |
+| `question-requested` | 宿主转发事件 `ctx.remote.$on("user-questions/request")`（waterfall 事件，插件只旁听并 `return next()` 把请求交还应答链）；会话事件 `tool/call` 且 `name === "ask_user_question"` 作为兜底。两条路径共用 1.5 秒去重，同一次提问只响一声 |
+| `stream-end` | `connection.generation` 变为 `undefined`，或 `connection.state` 进入 `disconnected`；两条信号共用 5 秒防抖 |
+| `subagent-complete` / `last-subagent-complete` | `sessions.list` 快照中 `origin === "subagent"` 行的 `running` 翻转；当前会话树内运行中的子代理数量从 ≥1 降到 0 时触发「最后一个」 |
+
+「当前会话」的判定：`sessions.list` 快照形如 `{ byId, phase }`，**没有 `current` 字段**；
+当前会话是 `retainedBy.mainView > 0` 的那一行（DSH 客户端自身的约定）。
+「仅当前会话响铃」据此过滤。
+
 ## 安装
 
 要求已安装 `dsh` CLI（`dsh --help` 存在）。
@@ -106,10 +121,16 @@ dsh plugin add ./dsh-sound-player-0.2.0.tgz
   首次交互时自动恢复 AudioContext）。
 - 音频数据保存在浏览器 IndexedDB（`dsh-sound-player` 库），配置保存在 localStorage，
   均只对本浏览器生效；清浏览器数据会清掉音效库。
-- 「服务终止」音效在连接断开约数秒内播放一次（带防抖），避免重连抖动重复响。
-- 「子代理运行完成」通过监听 `sessions` 列表中 `origin=subagent` 会话的
+- 「服务终止」在连接代际消失（`generation` → `undefined`）或连接状态进入
+  `disconnected` 时播放一次，带 5 秒防抖，避免重连抖动重复响。
+- 「子代理运行完成」通过 `sessions.list` 快照中 `origin === "subagent"` 行的
   `running` 状态翻转检测；「最后一个子代理运行完成」在当前会话树内运行中的
-  子代理数量从 ≥1 降到 0 时触发。
+  子代理数量从 ≥1 降到 0 时触发。父会话字段同时兼容 `parentSessionId`（Host 摘要）
+  与 `parentId` 两种命名。
+- `sessions.list` 与 `connection.generation` 属于客户端运行时的内部快照存储，
+  未出现在官方客户端服务契约（cordis-inspect 目录）里。插件对它们的读取都做了
+  判空与 `try/catch`：接口缺失时静默降级，不影响其他功能。升级 DSH 后建议重跑
+  仓库外的事件链自检脚本确认契约未变。
 
 ## 已知问题
 
