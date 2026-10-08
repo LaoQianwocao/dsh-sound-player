@@ -12,7 +12,7 @@
 ## 功能
 
 1. **设置页音效播放器**（设置 → 音效播放器）
-   - 总开关、仅当前会话响铃等全局选项（**没有全局音量**）；
+   - 总开关（**只有总开关**：没有全局音量，也没有「仅当前会话响铃」）；
    - 为每种「情况」绑定音效并开关，显示格式如 `【√】发送消息时播放【提示音1】`；
    - **每条绑定下方各有自己的音量滑块**，互不影响——对话完成可以响亮、子代理完成可以很轻；
    - 导入音频：选择文件 / 选择文件夹 / 拖拽音频到设置页。
@@ -29,14 +29,14 @@
    - 被提问时提示（AI 弹 `ask_user_question`，`question-requested`）
    - 服务终止时提示（连接断开，`stream-end`）
    - **子代理运行完成**（`subagent-complete`，任意子代理跑完）
-   - **最后一个子代理运行完成**（`last-subagent-complete`，当前会话树内所有运行中的子代理全部完成）
+   - **最后一个子代理运行完成**（`last-subagent-complete`，所有会话中运行中的子代理全部完成）
 
 4. **供其他插件使用的 API**（`ctx.get("soundPlayer")` 或 `window.__dshSoundPlayer__`）
    - 导入音频：`importAudioFile(file)` / `importAudioFiles(files)` / `importAudioDir(files)`
    - 增添情况：`addSituation({ label, trigger, audioId?, enabled?, volume? })` → 返回 id
    - 触发情况并播放音效：`triggerSituation(id)` / `trigger(id)`
    - 修改情况：`setSituation(id, patch)`、`setSituationEnabled(id, b)`、`setSituationAudio(id, audioId)`、`setSituationVolume(id, v)`、`removeSituation(id)`
-   - 其他：`listSounds()` / `listSoundsMeta()` / `deleteSound(id)` / `listSituations()` / `getState()` / `setEnabled` / `setVolume`（兼容入口，批量写入所有情况，非全局音量）/ `setOnlyCurrentSession` / `subscribe(fn)` / `stopAll()`
+   - 其他：`listSounds()` / `listSoundsMeta()` / `deleteSound(id)` / `listSituations()` / `getState()` / `setEnabled` / `setVolume`（兼容入口，批量写入所有情况，非全局音量）/ `subscribe(fn)` / `stopAll()`
 
 ## 触发方式（trigger）取值
 
@@ -64,11 +64,12 @@
 | `turn-end` / `user-message` / `approval-requested` | 当前会话的实时事件窗口 `sessions.binding(id).eventSource`：只处理 `append` 增量，订阅前用窗口最大 `seq` 建基线，避免回放历史事件响铃 |
 | `question-requested` | 宿主转发事件 `ctx.remote.$on("user-questions/request")`（waterfall 事件，插件只旁听并 `return next()` 把请求交还应答链）；会话事件 `tool/call` 且 `name === "ask_user_question"` 作为兜底。两条路径共用 1.5 秒去重，同一次提问只响一声 |
 | `stream-end` | `connection.generation` 变为 `undefined`，或 `connection.state` 进入 `disconnected`；两条信号共用 5 秒防抖 |
-| `subagent-complete` / `last-subagent-complete` | `sessions.list` 快照中 `origin === "subagent"` 行的 `running` 翻转；当前会话树内运行中的子代理数量从 ≥1 降到 0 时触发「最后一个」 |
+| `subagent-complete` / `last-subagent-complete` | `sessions.list` 快照中 `origin === "subagent"` 行的 `running` 翻转；**所有会话**（含后台会话）中运行中的子代理数量从 ≥1 降到 0 时触发「最后一个」 |
 
 「当前会话」的判定：`sessions.list` 快照形如 `{ byId, phase }`，**没有 `current` 字段**；
-当前会话是 `retainedBy.mainView > 0` 的那一行（DSH 客户端自身的约定）。
-「仅当前会话响铃」据此过滤。
+当前会话是 `retainedBy.mainView > 0` 的那一行（DSH 客户端自身的约定）。它只用来决定
+**订阅哪个会话的实时事件窗口**，不再用于过滤：插件已取消「仅当前会话响铃」，
+任何会话（含后台会话）触发的情况都会照常响铃。
 
 ## 安装
 
@@ -133,9 +134,12 @@ dsh plugin add ./dsh-sound-player-0.2.0.tgz
 - 「服务终止」在连接代际消失（`generation` → `undefined`）或连接状态进入
   `disconnected` 时播放一次，带 5 秒防抖，避免重连抖动重复响。
 - 「子代理运行完成」通过 `sessions.list` 快照中 `origin === "subagent"` 行的
-  `running` 状态翻转检测；「最后一个子代理运行完成」在当前会话树内运行中的
+  `running` 状态翻转检测；「最后一个子代理运行完成」在**所有会话**中运行中的
   子代理数量从 ≥1 降到 0 时触发。父会话字段同时兼容 `parentSessionId`（Host 摘要）
   与 `parentId` 两种命名。
+- 不再按会话过滤：插件已取消「仅当前会话响铃」设置，后台会话、其它会话触发的情况
+  同样会响铃（配置 v3 → v4 会丢弃老的该字段）。实时事件仍来自当前会话的事件窗口，
+  子代理检测则覆盖全部会话。
 - `sessions.list` 与 `connection.generation` 属于客户端运行时的内部快照存储，
   未出现在官方客户端服务契约（cordis-inspect 目录）里。插件对它们的读取都做了
   判空与 `try/catch`：接口缺失时静默降级，不影响其他功能。桌面端升级后建议重跑

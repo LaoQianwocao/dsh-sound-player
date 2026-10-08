@@ -253,6 +253,10 @@ function report() {
   else fail("migration: permission-request volume = " + (perm && perm.volume));
   if (board.getState().volume === undefined) ok("no global volume exposed in getState()");
   else fail("getState() still exposes volume = " + board.getState().volume);
+  if (board.getState().onlyCurrentSession === undefined) ok("no session filtering exposed in getState()");
+  else fail("getState() still exposes onlyCurrentSession = " + board.getState().onlyCurrentSession);
+  if (board.setOnlyCurrentSession === undefined) ok("setOnlyCurrentSession removed from the API");
+  else fail("setOnlyCurrentSession is still part of the public API");
 
   // 2) turn end
   await fireSessionEvent("turn/end", { turn: 1, reason: { kind: "completed" } });
@@ -302,25 +306,34 @@ function report() {
   if (board.listSituations().every((s) => near(s.volume, 0.6))) ok("legacy setVolume(v) bulk-writes all situations");
   else fail("legacy setVolume(v) did not bulk-apply to every situation");
 
-  // 7) subagent completion + last subagent completion
+  // 7) subagents are no longer scoped to the current session tree
   listState.byId = {
     "sess-main": { id: "sess-main", retainedBy: { mainView: 1 }, running: true },
     "sub-1": { id: "sub-1", origin: "subagent", parentSessionId: "sess-main", running: true },
+    "other-sess": { id: "other-sess", running: false }, // 另一个顶层会话，不在当前会话树内
+    "sub-bg": { id: "sub-bg", origin: "subagent", parentSessionId: "other-sess", running: true },
   };
-  callList(); // wave starts
+  callList(); // wave starts with sub-1 + sub-bg
   take();
-  listState.byId = {
-    "sess-main": { id: "sess-main", retainedBy: { mainView: 1 }, running: true },
-    "sub-1": { id: "sub-1", origin: "subagent", parentSessionId: "sess-main", running: false },
-  };
+  // 后台会话的子代理先完成，而当前会话树的 sub-1 仍在运行
+  listState.byId["sub-bg"] = { id: "sub-bg", origin: "subagent", parentSessionId: "other-sess", running: false };
   callList();
   await delay(40);
-  const wave = take();
-  const chunks = [];
-  for (let i = 0; i < wave.length; i += 4) chunks.push(nameOf(wave.slice(i, i + 4)));
-  if (chunks.includes(SIG2NAME[SYNTH.complete]) && chunks.includes(SIG2NAME[SYNTH.success])) {
-    ok("subagent-complete + last-subagent-complete -> " + chunks.join(" + "));
-  } else fail("subagent chain -> " + (chunks.join(" + ") || "(no sound)"));
+  let subPlay = take();
+  const subName = subPlay.length ? nameOf(subPlay) : "(no sound)";
+  if (subName === SIG2NAME[SYNTH.complete]) ok("background-session subagent completion rings (no session filter)");
+  else fail("background subagent -> " + subName + " (want " + SIG2NAME[SYNTH.complete] + ")");
+
+  // 最后一个还在跑的（sub-1）完成后：完成音 + 波结束的成功音
+  listState.byId["sub-1"] = { id: "sub-1", origin: "subagent", parentSessionId: "sess-main", running: false };
+  callList();
+  await delay(40);
+  subPlay = take();
+  const subChunks = [];
+  for (let i = 0; i + 4 <= subPlay.length; i += 4) subChunks.push(nameOf(subPlay.slice(i, i + 4)));
+  if (subChunks.includes(SIG2NAME[SYNTH.complete]) && subChunks.includes(SIG2NAME[SYNTH.success])) {
+    ok("subagent-complete + last-subagent-complete -> " + subChunks.join(" + "));
+  } else fail("subagent chain -> " + (subChunks.join(" + ") || "(no sound)"));
 
   // 8) service stop via generation disappearing
   take();

@@ -118,9 +118,8 @@ window.__ModuleLoader__.load({
 		];
 		function defaultConfig() {
 			return {
-				v: 3,
+				v: 4,
 				enabled: true,
-				onlyCurrentSession: true,
 				situations: deepClone(DEFAULT_SITUATIONS)
 			};
 		}
@@ -160,6 +159,8 @@ window.__ModuleLoader__.load({
 					s.volume = typeof s.volume === "number" ? clamp(s.volume, 0, 1) : legacyVolume;
 				}
 				delete cfg.volume;
+				// 迁移 v3 -> v4：取消「仅当前会话响铃」，不再按会话过滤事件。
+				delete cfg.onlyCurrentSession;
 				cfg.v = base.v;
 				return cfg;
 			} catch (err) {
@@ -377,23 +378,20 @@ window.__ModuleLoader__.load({
 		// 以及会话事件流里的 ask_user_question 工具调用。两条路径共用这个防抖，
 		// 保证同一次提问只响一声。
 		let lastQuestionPlay = 0;
-		function triggerQuestionOnce(sessionId) {
+		function triggerQuestionOnce() {
 			const now = Date.now();
 			if (now - lastQuestionPlay < 1500) return;
 			lastQuestionPlay = now;
-			triggerByEvent("question-requested", sessionId);
+			triggerByEvent("question-requested");
 		}
 		function situationByTrigger(trigger) {
 			if (!config.enabled) return null;
 			return config.situations.find((s) => s.trigger === trigger && s.enabled) || null;
 		}
-		async function triggerByEvent(trigger, sessionId) {
+		async function triggerByEvent(trigger) {
+			// 不再按会话过滤：任何会话（含后台会话）的事件都照常响铃。
 			const sit = situationByTrigger(trigger);
 			if (!sit || !sit.audioId) return;
-			if (sessionId && config.onlyCurrentSession) {
-				const cur = currentSessionId();
-				if (cur && cur !== sessionId) return;
-			}
 			await playSituation(sit.id);
 		}
 		async function playSituation(sitId) {
@@ -415,7 +413,6 @@ window.__ModuleLoader__.load({
 		// `sessions.binding(id).eventSource` 的窗口里持续追加。这里订阅当前会话
 		// 的 eventSource，按事件类型映射到内置触发器。
 		function startSessionWatcher(sessions, connection) {
-			let currentId;
 			let attachedId = null; // null = 尚未附着；会话 id 是字符串，不会与 null 冲突
 			let unbindEvent = null;
 			let lastSeenSeq = -1;
@@ -427,17 +424,17 @@ window.__ModuleLoader__.load({
 				if (!ev || typeof ev !== "object" || typeof ev.type !== "string") return;
 				switch (ev.type) {
 					case "turn/end":
-						triggerByEvent("turn-end", currentId);
+						triggerByEvent("turn-end");
 						break;
 					case "user/message":
-						if (ev.data && ev.data.source && ev.data.source.kind === "user") triggerByEvent("user-message", currentId);
+						if (ev.data && ev.data.source && ev.data.source.kind === "user") triggerByEvent("user-message");
 						break;
 					case "approval/asked":
-						triggerByEvent("approval-requested", currentId);
+						triggerByEvent("approval-requested");
 						break;
 					case "tool/call":
 						// 被提问的底层信号（兜底）：模型调用 ask_user_question 工具。
-						if (ev.data && ev.data.name === "ask_user_question") triggerQuestionOnce(currentId);
+						if (ev.data && ev.data.name === "ask_user_question") triggerQuestionOnce();
 						break;
 				}
 			};
@@ -477,7 +474,6 @@ window.__ModuleLoader__.load({
 				// 实时窗口）则重试。
 				if (id === attachedId && unbindEvent) return;
 				detach();
-				currentId = id;
 				attachedId = id;
 				lastSeenSeq = -1;
 				if (id === undefined || !sessions || typeof sessions.binding !== "function") return;
@@ -556,65 +552,37 @@ window.__ModuleLoader__.load({
 
 		// 子代理检测：监听 sessions 列表，origin=subagent 的会话 running 状态翻转。
 		// - subagent-complete：任意子代理从运行中变为完成
-		// - last-subagent-complete：当前会话树内所有运行中的子代理全部完成（一轮"波"结束）
+		// - last-subagent-complete：所有运行中的子代理全部完成（一轮"波"结束）
+		// 已取消会话过滤，因此不再限定「当前会话树」：任何会话（含后台会话）的子代理
+		// 都会计入并触发，切换会话也不再重置波状态。
 		function startSubagentWatcher(sessions) {
-			const seen = new Map(); // subagentId -> { wasRunning }
+			const seen = new Set(); // 上一次快照里处于运行中的子代理
 			let waveRunning = false; // 当前是否存在运行中的子代理
-			let lastCurrent;
 			let unsub = null;
 			try {
 				const list = sessions && sessions.list;
 				if (!list || typeof list.subscribe !== "function" || typeof list.getSnapshot !== "function") return null;
-				const isDescendantOf = (candidateId, ancestorId, byId) => {
-					let cur = candidateId;
-					let hops = 0;
-					while (cur !== undefined && cur !== ancestorId && hops < 32) {
-						const row = byId[cur];
-						if (!isSubagentRow(row)) return false;
-						const parent = parentSessionOf(row);
-						if (parent === undefined) return false;
-						cur = parent;
-						hops += 1;
-					}
-					return cur === ancestorId;
-				};
 				unsub = list.subscribe(() => {
 					const st = sessionListSnapshot();
 					if (!st || !st.byId) return;
-					const current = currentSessionId();
-					if (current !== lastCurrent) {
-						// 切换会话：重置跟踪状态，避免串音
-						lastCurrent = current;
-						seen.clear();
-						waveRunning = false;
-					}
 					const runningNow = [];
 					for (const [id, row] of Object.entries(st.byId)) {
-						if (!isSubagentRow(row)) continue;
-						const parent = parentSessionOf(row);
-						if (current !== undefined && parent !== undefined && !isDescendantOf(id, current, st.byId)) continue;
-						if (row.running) runningNow.push(id);
+						if (isSubagentRow(row) && row.running) runningNow.push(id);
 					}
-					// 检测完成翻转（running: true -> false）
-					for (const [id, rec] of seen) {
+					// 检测完成翻转（上一次在跑、这次不在跑）
+					for (const id of Array.from(seen)) {
 						const row = st.byId[id];
-						if (row === undefined) { seen.delete(id); continue; }
-						if (rec.wasRunning && !row.running) {
-							triggerByEvent("subagent-complete", current);
+						if (row === undefined) { seen.delete(id); continue; } // 会话消失，不算完成
+						if (!row.running) {
+							seen.delete(id);
+							triggerByEvent("subagent-complete");
 						}
-						rec.wasRunning = !!row.running;
 					}
-					for (const id of runningNow) {
-						const rec = seen.get(id);
-						if (rec) rec.wasRunning = true;
-						else seen.set(id, { wasRunning: true });
-					}
+					for (const id of runningNow) seen.add(id);
 					// 波检测：从"有运行中的子代理"变为"无" → 最后一个完成
 					const prevWave = waveRunning;
 					waveRunning = runningNow.length > 0;
-					if (prevWave && !waveRunning) {
-						triggerByEvent("last-subagent-complete", current);
-					}
+					if (prevWave && !waveRunning) triggerByEvent("last-subagent-complete");
 				});
 			} catch (err) {
 				return null;
@@ -719,11 +687,9 @@ window.__ModuleLoader__.load({
 				config.situations.forEach((s) => { s.volume = vol; });
 				emitChange();
 			},
-			setOnlyCurrentSession(v) { config.onlyCurrentSession = !!v; emitChange(); },
 			getState() {
 				return {
 					enabled: config.enabled,
-					onlyCurrentSession: config.onlyCurrentSession,
 					situations: deepClone(config.situations)
 				};
 			},
@@ -885,13 +851,6 @@ window.__ModuleLoader__.load({
 						),
 						h("span", { className: "dsp-label" }, "启用音效播放器"),
 						h("button", { className: "dsp-btn", onClick: () => board.stopAll() }, "停止")
-					),
-					h("div", { className: "dsp-row" },
-						h("label", { className: "dsp-toggle" },
-							h("input", { type: "checkbox", checked: !!state.onlyCurrentSession, onChange: (e) => board.setOnlyCurrentSession(e.target.checked) }),
-							h("span", { className: "dsp-knob" })
-						),
-						h("span", { className: "dsp-label" }, "仅当前会话响铃")
 					)
 				),
 				h("div", { className: "dsp-sec" },
@@ -1044,9 +1003,7 @@ window.__ModuleLoader__.load({
 				const remote = ctx.remote;
 				if (remote && typeof remote.$on === "function") {
 					disposeQuestions = remote.$on("user-questions/request", (request, next) => {
-						let sid;
-						try { sid = request && request.agent ? request.agent.id : undefined; } catch (err) { sid = undefined; }
-						triggerQuestionOnce(sid === undefined ? currentSessionId() : sid);
+						triggerQuestionOnce();
 						return typeof next === "function" ? next() : undefined;
 					});
 				}
