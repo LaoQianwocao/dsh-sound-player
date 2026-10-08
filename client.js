@@ -18,6 +18,8 @@ window.__ModuleLoader__.load({
 		const CONFIG_KEY = "dsh-sound-player:config:v1";
 		const DB_NAME = "dsh-sound-player";
 		const DB_STORE = "sounds";
+		// 不再有全局音量：每条情况各自持有一份音量，这里是「该条没写音量」时的兜底。
+		const DEFAULT_VOLUME = 0.8;
 		const TRIGGER_LABELS = {
 			"turn-end": "对话完成",
 			"user-message": "发送消息时",
@@ -106,19 +108,18 @@ window.__ModuleLoader__.load({
 
 		// #region 配置（localStorage）
 		const DEFAULT_SITUATIONS = [
-			{ id: "conversation-complete", label: "对话完成提示", trigger: "turn-end", enabled: true, audioId: "synth-complete", builtin: true },
-			{ id: "user-ask", label: "发送消息时提示", trigger: "user-message", enabled: true, audioId: "sys-ding", builtin: true },
-			{ id: "permission-request", label: "权限请求时提示", trigger: "approval-requested", enabled: true, audioId: "synth-warn", builtin: true },
-			{ id: "agent-question", label: "被提问时提示", trigger: "question-requested", enabled: true, audioId: "synth-question", builtin: true },
-			{ id: "service-stop", label: "服务终止时提示", trigger: "stream-end", enabled: true, audioId: "synth-stop", builtin: true },
-			{ id: "subagent-done", label: "子代理运行完成", trigger: "subagent-complete", enabled: true, audioId: "synth-complete", builtin: true },
-			{ id: "last-subagent-done", label: "最后一个子代理运行完成", trigger: "last-subagent-complete", enabled: true, audioId: "synth-success", builtin: true }
+			{ id: "conversation-complete", label: "对话完成提示", trigger: "turn-end", enabled: true, audioId: "synth-complete", volume: 0.8, builtin: true },
+			{ id: "user-ask", label: "发送消息时提示", trigger: "user-message", enabled: true, audioId: "sys-ding", volume: 0.8, builtin: true },
+			{ id: "permission-request", label: "权限请求时提示", trigger: "approval-requested", enabled: true, audioId: "synth-warn", volume: 0.8, builtin: true },
+			{ id: "agent-question", label: "被提问时提示", trigger: "question-requested", enabled: true, audioId: "synth-question", volume: 0.8, builtin: true },
+			{ id: "service-stop", label: "服务终止时提示", trigger: "stream-end", enabled: true, audioId: "synth-stop", volume: 0.8, builtin: true },
+			{ id: "subagent-done", label: "子代理运行完成", trigger: "subagent-complete", enabled: true, audioId: "synth-complete", volume: 0.8, builtin: true },
+			{ id: "last-subagent-done", label: "最后一个子代理运行完成", trigger: "last-subagent-complete", enabled: true, audioId: "synth-success", volume: 0.8, builtin: true }
 		];
 		function defaultConfig() {
 			return {
-				v: 2,
+				v: 3,
 				enabled: true,
-				volume: 0.8,
 				onlyCurrentSession: true,
 				situations: deepClone(DEFAULT_SITUATIONS)
 			};
@@ -151,6 +152,15 @@ window.__ModuleLoader__.load({
 						if (exist.audioId == null && def.audioId) exist.audioId = def.audioId; // 迁移：老配置自动补默认音效
 					}
 				}
+				// 迁移 v2 -> v3：音量从「全局一份」改为「每条情况一份」。
+				// 老配置的全局 volume 作为每条情况音量的初值，保证升级后响度不变，
+				// 随后丢弃全局字段——播放时不再读任何全局音量。
+				const legacyVolume = typeof cfg.volume === "number" ? clamp(cfg.volume, 0, 1) : DEFAULT_VOLUME;
+				for (const s of cfg.situations) {
+					s.volume = typeof s.volume === "number" ? clamp(s.volume, 0, 1) : legacyVolume;
+				}
+				delete cfg.volume;
+				cfg.v = base.v;
 				return cfg;
 			} catch (err) {
 				return base;
@@ -269,7 +279,7 @@ window.__ModuleLoader__.load({
 					const src = c.createBufferSource();
 					src.buffer = buf;
 					const g = c.createGain();
-					g.gain.value = clamp(volume == null ? config.volume : volume, 0, 1);
+					g.gain.value = clamp(volume == null ? DEFAULT_VOLUME : volume, 0, 1);
 					src.connect(g);
 					g.connect(this.master);
 					src.onended = () => this.active.delete(soundId);
@@ -282,7 +292,7 @@ window.__ModuleLoader__.load({
 			playRecipe(recipe, volume) {
 				const c = this.ensure();
 				if (!c) return;
-				const vol = clamp(volume == null ? config.volume : volume, 0, 1);
+				const vol = clamp(volume == null ? DEFAULT_VOLUME : volume, 0, 1);
 				const now = c.currentTime;
 				for (const n of recipe) {
 					if (!n || !n.f) continue;
@@ -393,7 +403,8 @@ window.__ModuleLoader__.load({
 			const sounds = await listSounds();
 			const snd = sounds.find((s) => s.id === sit.audioId);
 			if (!snd) return false;
-			await engine.play(snd);
+			// 音量只来自这条绑定自身，没有全局音量参与。
+			await engine.play(snd, typeof sit.volume === "number" ? sit.volume : DEFAULT_VOLUME);
 			return true;
 		}
 		// #endregion
@@ -654,7 +665,7 @@ window.__ModuleLoader__.load({
 				return ok;
 			},
 			// —— 情况管理 ——
-			addSituation({ id, label, trigger, audioId, enabled }) {
+			addSituation({ id, label, trigger, audioId, enabled, volume }) {
 				const sitId = id || uid("sit");
 				if (config.situations.some((s) => s.id === sitId)) throw new Error("situation id already exists: " + sitId);
 				config.situations.push({
@@ -662,6 +673,7 @@ window.__ModuleLoader__.load({
 					label: String(label || sitId),
 					trigger: trigger || "manual",
 					audioId: audioId || null,
+					volume: typeof volume === "number" ? clamp(volume, 0, 1) : DEFAULT_VOLUME,
 					enabled: enabled !== false,
 					builtin: false
 				});
@@ -692,18 +704,25 @@ window.__ModuleLoader__.load({
 			setSituationAudio(id, audioId) {
 				return soundPlayer.setSituation(id, { audioId: audioId || null });
 			},
+			setSituationVolume(id, volume) {
+				return soundPlayer.setSituation(id, { volume: clamp(Number(volume) || 0, 0, 1) });
+			},
 			listSituations() { return deepClone(config.situations); },
 			// —— 触发 ——
 			triggerSituation(id) { return playSituation(id); },
 			trigger(id) { return playSituation(id); },
 			// —— 全局 ——
 			setEnabled(v) { config.enabled = !!v; emitChange(); },
-			setVolume(v) { config.volume = clamp(Number(v) || 0, 0, 1); emitChange(); },
+			// 兼容旧调用：已无全局音量，改为把同一个音量批量写入所有情况。
+			setVolume(v) {
+				const vol = clamp(Number(v) || 0, 0, 1);
+				config.situations.forEach((s) => { s.volume = vol; });
+				emitChange();
+			},
 			setOnlyCurrentSession(v) { config.onlyCurrentSession = !!v; emitChange(); },
 			getState() {
 				return {
 					enabled: config.enabled,
-					volume: config.volume,
 					onlyCurrentSession: config.onlyCurrentSession,
 					situations: deepClone(config.situations)
 				};
@@ -731,8 +750,11 @@ window.__ModuleLoader__.load({
 .dsp-toggle input:checked + .dsp-knob::after { transform: translateX(15px); }
 .dsp-label { flex: 1; min-width: 0; }
 .dsp-muted { color: var(--dsw-alias-label-tertiary, #9ca3af); font-size: 12px; }
-.dsp-sit-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px dashed var(--dsw-alias-border-l2, rgba(255,255,255,.07)); }
-.dsp-sit-row:last-child { border-bottom: none; }
+.dsp-sit-block { padding: 6px 0; border-bottom: 1px dashed var(--dsw-alias-border-l2, rgba(255,255,255,.07)); }
+.dsp-sit-block:last-child { border-bottom: none; }
+.dsp-sit-row { display: flex; align-items: center; gap: 8px; }
+.dsp-vol-row { display: flex; align-items: center; gap: 8px; padding: 3px 0 0 42px; }
+.dsp-vol-row .dsp-range { max-width: 220px; }
 .dsp-sit-label { flex: 1; min-width: 0; line-height: 1.3; }
 .dsp-sit-label .dsp-sit-name { display: block; }
 .dsp-sit-label .dsp-sit-trigger { font-size: 11px; color: var(--dsw-alias-label-tertiary, #6b7280); }
@@ -775,31 +797,50 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		function SituationRow({ sit, sounds, onChange, onRemove, onTest }) {
+		function SituationRow({ sit, sounds, onChange, onRemove, onTest, onVolume }) {
 			const options = [h("option", { key: "_none", value: "" }, "（无）")];
 			for (const s of sounds) {
 				options.push(h("option", { key: s.id, value: s.id }, s.name));
 			}
-			return h("div", { className: "dsp-sit-row" },
-				h("label", { className: "dsp-toggle", title: sit.enabled ? "已启用" : "已停用" },
+			const vol = typeof sit.volume === "number" ? sit.volume : DEFAULT_VOLUME;
+			return h("div", { className: "dsp-sit-block" },
+				h("div", { className: "dsp-sit-row" },
+					h("label", { className: "dsp-toggle", title: sit.enabled ? "已启用" : "已停用" },
+						h("input", {
+							type: "checkbox",
+							checked: !!sit.enabled,
+							onChange: (e) => onChange({ enabled: e.target.checked })
+						}),
+						h("span", { className: "dsp-knob" })
+					),
+					h("div", { className: "dsp-sit-label" },
+						h("span", { className: "dsp-sit-name" }, (sit.enabled ? "【√】" : "【 】") + sit.label + (sit.builtin ? "" : "（自定义）")),
+						h("span", { className: "dsp-sit-trigger" }, "触发：" + (TRIGGER_LABELS[sit.trigger] || sit.trigger))
+					),
+					h("select", {
+						className: "dsp-select",
+						value: sit.audioId || "",
+						onChange: (e) => onChange({ audioId: e.target.value || null })
+					}, options),
+					h("button", { className: "dsp-btn", disabled: !sit.audioId, onClick: onTest }, "听"),
+					!sit.builtin ? h("button", { className: "dsp-btn dsp-danger", onClick: onRemove }, "删") : null
+				),
+				// 每条绑定自己的音量，互不影响；没有绑定音效时无意义，置灰。
+				h("div", { className: "dsp-vol-row" },
+					h("span", { className: "dsp-muted", style: { flex: "none" } }, "音量"),
 					h("input", {
-						type: "checkbox",
-						checked: !!sit.enabled,
-						onChange: (e) => onChange({ enabled: e.target.checked })
+						className: "dsp-range",
+						type: "range",
+						min: 0,
+						max: 1,
+						step: 0.05,
+						value: vol,
+						disabled: !sit.audioId,
+						title: "这条情况单独的音量",
+						onChange: (e) => onVolume(Number(e.target.value))
 					}),
-					h("span", { className: "dsp-knob" })
-				),
-				h("div", { className: "dsp-sit-label" },
-					h("span", { className: "dsp-sit-name" }, (sit.enabled ? "【√】" : "【 】") + sit.label + (sit.builtin ? "" : "（自定义）")),
-					h("span", { className: "dsp-sit-trigger" }, "触发：" + (TRIGGER_LABELS[sit.trigger] || sit.trigger))
-				),
-				h("select", {
-					className: "dsp-select",
-					value: sit.audioId || "",
-					onChange: (e) => onChange({ audioId: e.target.value || null })
-				}, options),
-				h("button", { className: "dsp-btn", disabled: !sit.audioId, onClick: onTest }, "听"),
-				!sit.builtin ? h("button", { className: "dsp-btn dsp-danger", onClick: onRemove }, "删") : null
+					h("span", { className: "dsp-muted", style: { width: 36, textAlign: "right" } }, Math.round(vol * 100) + "%")
+				)
 			);
 		}
 
@@ -836,7 +877,7 @@ window.__ModuleLoader__.load({
 				h("div", { className: "dsp-settings-head" }, "🎵 音效播放器"),
 				h("div", { className: "dsp-settings-sub" }, "在对话各阶段播放提示音（对话完成、权限请求、子代理完成等）。所有操作都在此设置页完成。"),
 				h("div", { className: "dsp-sec" },
-					h("div", { className: "dsp-sec-title" }, "总开关与音量"),
+					h("div", { className: "dsp-sec-title" }, "总开关"),
 					h("div", { className: "dsp-row" },
 						h("label", { className: "dsp-toggle" },
 							h("input", { type: "checkbox", checked: !!state.enabled, onChange: (e) => board.setEnabled(e.target.checked) }),
@@ -844,11 +885,6 @@ window.__ModuleLoader__.load({
 						),
 						h("span", { className: "dsp-label" }, "启用音效播放器"),
 						h("button", { className: "dsp-btn", onClick: () => board.stopAll() }, "停止")
-					),
-					h("div", { className: "dsp-row" },
-						h("span", { className: "dsp-label dsp-muted", style: { flex: "none" } }, "音量"),
-						h("input", { className: "dsp-range", type: "range", min: 0, max: 1, step: 0.05, value: state.volume, onChange: (e) => board.setVolume(Number(e.target.value)) }),
-						h("span", { className: "dsp-muted", style: { width: 36, textAlign: "right" } }, Math.round(state.volume * 100) + "%")
 					),
 					h("div", { className: "dsp-row" },
 						h("label", { className: "dsp-toggle" },
@@ -867,7 +903,8 @@ window.__ModuleLoader__.load({
 							sounds,
 							onChange: (patch) => board.setSituation(sit.id, patch),
 							onRemove: () => board.removeSituation(sit.id),
-							onTest: () => board.triggerSituation(sit.id)
+							onTest: () => board.triggerSituation(sit.id),
+							onVolume: (v) => board.setSituationVolume(sit.id, v)
 						}))
 					),
 					h("div", { className: "dsp-row", style: { marginTop: 8 } },

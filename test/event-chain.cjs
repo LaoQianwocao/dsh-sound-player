@@ -28,6 +28,12 @@ let PLAYED = [];
 const take = () => { const p = PLAYED; PLAYED = []; return p; };
 const sig = (p) => p.map((x) => (x.kind === "file" ? "FILE" : x.f + "@" + x.t)).join(",");
 
+// Every gain write reaches the graph here: `value =` for file sounds, the attack
+// ramp for synth notes (release tails ramp to 0.0001 and are filtered out).
+let GAINS = [];
+const takeGains = () => { const g = GAINS; GAINS = []; return g; };
+const peaks = (g) => g.filter((v) => v > 0.0002);
+
 const SYNTH = {
   "prompt-ding": "1046.5@0",
   "complete": "523.25@0,659.25@0.1,783.99@0.2,1046.5@0.3",
@@ -45,7 +51,15 @@ const nameOf = (p) => {
 const SIG2NAME = Object.fromEntries(Object.entries(SYNTH).map(([n, v]) => [v, n]));
 
 class GainStub {
-  constructor() { this.gain = { value: 1, setValueAtTime() {}, exponentialRampToValueAtTime() {} }; }
+  constructor() {
+    this.gain = {
+      _v: 1,
+      get value() { return this._v; },
+      set value(v) { this._v = v; GAINS.push(v); },
+      setValueAtTime() {},
+      exponentialRampToValueAtTime(v) { GAINS.push(v); },
+    };
+  }
   connect() {}
 }
 class OscStub {
@@ -99,6 +113,17 @@ globalThis.window = {
   addEventListener() {},
   AudioContext: AudioContextStub,
 };
+// Pre-seed a v2 config: the old GLOBAL volume (0.5) must migrate into every
+// situation's own volume, and the global field must disappear.
+localStorageStub.setItem("dsh-sound-player:config:v1", JSON.stringify({
+  v: 2,
+  enabled: true,
+  volume: 0.5,
+  onlyCurrentSession: true,
+  situations: [
+    { id: "conversation-complete", label: "旧名", trigger: "turn-end", enabled: true, audioId: "synth-complete", builtin: true },
+  ],
+}));
 globalThis.document = {
   getElementById: () => null,
   createElement: () => ({ id: "", textContent: "" }),
@@ -113,8 +138,10 @@ console.warn = (...a) => { warns.push(a.join(" ")); };
 
 vm.runInThisContext(code, { filename: target });
 
+// Minimal element tree instead of null, so the rendered settings page can be
+// asserted structurally (function components are invoked by renderNodes below).
 const React = {
-  createElement: () => null,
+  createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
   useState: (v) => [typeof v === "function" ? v() : v, () => {}],
   useEffect: () => {},
   useRef: () => ({ current: null }),
@@ -149,6 +176,7 @@ const connection = {
   generation: { getSnapshot: () => gen, subscribe: (cb) => { genListener = cb; return () => {}; } },
   state: { getSnapshot: () => connState, subscribe: (cb) => { stateListener = cb; return () => {}; } },
 };
+const REGISTERED = []; // settings.section registrations, for the UI assertions
 const ctx = {
   sessions,
   provide() {},
@@ -157,7 +185,10 @@ const ctx = {
   remote: {
     $on: (ev, l) => { if (ev === "user-questions/request") questionListener = l; return () => { questionListener = null; }; },
   },
-  slots: { inject: (k, cb) => { try { cb(); } catch (e) {} return () => {}; }, register: () => () => {} },
+  slots: {
+    inject: (k, cb) => { try { cb(); } catch (e) {} return () => {}; },
+    register: (spec, component) => { REGISTERED.push({ spec, component }); return () => {}; },
+  },
 };
 
 mod.apply(ctx);
@@ -182,6 +213,14 @@ async function expect(label, wantSig) {
   if (gotSig === wantSig) ok(label + " -> " + nameOf(p));
   else fail(label + " -> " + (p.length ? nameOf(p) : "(no sound)") + " (want " + (SIG2NAME[wantSig] || wantSig) + ")");
 }
+const near = (a, b) => Math.abs(a - b) < 1e-6;
+async function expectGains(label, want) {
+  await delay(30);
+  const got = peaks(takeGains());
+  const good = got.length === want.length && got.every((v, i) => near(v, want[i]));
+  if (good) ok(label + " -> [" + got.join(", ") + "]");
+  else fail(label + " -> [" + got.join(", ") + "] (want [" + want.join(", ") + "])");
+}
 
 function report() {
   console.warn = origWarn;
@@ -202,6 +241,18 @@ function report() {
   callList();
   if (boundIds.includes("sess-main")) ok("current session = retainedBy.mainView row");
   else fail("current session not resolved (esListener will stay unsubscribed)");
+
+  // 1a) v2 -> v3 migration of the pre-seeded config
+  const board = globalThis.window.__dshSoundPlayer__;
+  const sitById = (id) => board.listSituations().find((s) => s.id === id);
+  const conv = sitById("conversation-complete");
+  const perm = sitById("permission-request");
+  if (conv && near(conv.volume, 0.5)) ok("migration: legacy global volume 0.5 -> per-situation volume");
+  else fail("migration: conversation-complete volume = " + (conv && conv.volume));
+  if (perm && near(perm.volume, 0.8)) ok("migration: merged built-in gets default volume 0.8");
+  else fail("migration: permission-request volume = " + (perm && perm.volume));
+  if (board.getState().volume === undefined) ok("no global volume exposed in getState()");
+  else fail("getState() still exposes volume = " + board.getState().volume);
 
   // 2) turn end
   await fireSessionEvent("turn/end", { turn: 1, reason: { kind: "completed" } });
@@ -229,6 +280,27 @@ function report() {
     await expect("question-requested (user-questions/request)", SYNTH.question);
     if (nextCalled) ok("waterfall delegated via next()"); else fail("next() not called -> would break the ask chain");
   } else fail("user-questions/request listener not registered");
+
+  // 6b) per-situation volume reaches the graph, and items are independent
+  board.setSituationVolume("conversation-complete", 0.25);
+  board.setSituationVolume("permission-request", 0.5);
+  take(); takeGains();
+  await fireSessionEvent("turn/end", { turn: 2, reason: { kind: "completed" } });
+  // 完成音 recipe gains 0.4/0.4/0.4/0.45 × 0.25
+  await expectGains("turn-end at its own volume 0.25", [0.1, 0.1, 0.1, 0.1125]);
+  take(); takeGains();
+  await fireSessionEvent("approval/asked", {});
+  await expectGains("approval at its own volume 0.5", [0.175, 0.175]); // 警告音 0.35 × 0.5
+  take(); takeGains();
+  await fireSessionEvent("turn/end", { turn: 3, reason: { kind: "completed" } });
+  await expectGains("turn-end unaffected by edits to another item", [0.1, 0.1, 0.1, 0.1125]);
+  board.setSituationVolume("user-ask", 0.3);
+  take(); takeGains();
+  await fireSessionEvent("user/message", { source: { kind: "user" } });
+  await expectGains("file sound at its own volume 0.3", [0.3]);
+  board.setVolume(0.6); // legacy call must not reintroduce a global volume
+  if (board.listSituations().every((s) => near(s.volume, 0.6))) ok("legacy setVolume(v) bulk-writes all situations");
+  else fail("legacy setVolume(v) did not bulk-apply to every situation");
 
   // 7) subagent completion + last subagent completion
   listState.byId = {
@@ -267,6 +339,41 @@ function report() {
     const dup = take();
     if (dup.length === 0) ok("stream-end debounced within 5s"); else fail("debounce failed: " + nameOf(dup));
   } else fail("connection.state not subscribed");
+
+  // 10) rendered settings page: one volume slider per binding item, no global one
+  function renderNodes(node, out) {
+    if (node == null || node === false || node === true) return out;
+    if (Array.isArray(node)) { for (const n of node) renderNodes(n, out); return out; }
+    if (typeof node !== "object") return out;
+    if (typeof node.type === "function") return renderNodes(node.type(node.props), out);
+    out.push(node);
+    for (const c of node.children || []) renderNodes(c, out);
+    return out;
+  }
+  function renderTexts(node, out) {
+    if (node == null || node === false || node === true) return out;
+    if (typeof node === "string" || typeof node === "number") { out.push(String(node)); return out; }
+    if (Array.isArray(node)) { for (const n of node) renderTexts(n, out); return out; }
+    if (typeof node !== "object") return out;
+    if (typeof node.type === "function") return renderTexts(node.type(node.props), out);
+    for (const c of node.children || []) renderTexts(c, out);
+    return out;
+  }
+  if (!REGISTERED.length) fail("settings.section was never registered");
+  else {
+    const tree = React.createElement(REGISTERED[0].component, { board });
+    const nodes = renderNodes(tree, []);
+    const texts = renderTexts(tree, []);
+    const sliders = nodes.filter((n) => n.type === "input" && n.props.type === "range");
+    const perItem = sliders.filter((n) => typeof n.props.title === "string" && n.props.title.indexOf("这条情况") >= 0);
+    const count = board.listSituations().length;
+    if (sliders.length === count && perItem.length === count) {
+      ok("UI: " + count + " per-item volume sliders and no global slider");
+    } else fail("UI: " + sliders.length + " sliders / " + perItem.length + " per-item (expect " + count + ")");
+    if (texts.includes("总开关") && !texts.some((t) => t.indexOf("总开关与音量") >= 0)) {
+      ok("UI: global volume row removed from the switch section");
+    } else fail("UI: switch section title still mentions volume");
+  }
 
   report();
 })();

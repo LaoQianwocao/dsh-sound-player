@@ -12,8 +12,9 @@
 ## 功能
 
 1. **设置页音效播放器**（设置 → 音效播放器）
-   - 总开关、音量、仅当前会话响铃等全局选项；
+   - 总开关、仅当前会话响铃等全局选项（**没有全局音量**）；
    - 为每种「情况」绑定音效并开关，显示格式如 `【√】发送消息时播放【提示音1】`；
+   - **每条绑定下方各有自己的音量滑块**，互不影响——对话完成可以响亮、子代理完成可以很轻；
    - 导入音频：选择文件 / 选择文件夹 / 拖拽音频到设置页。
 
 2. **内置默认音效**（开箱即用，七种默认情况已预绑定）
@@ -26,16 +27,16 @@
    - 发送消息时提示（你发送消息，`user-message`）
    - 权限请求时提示（`approval-requested`）
    - 被提问时提示（AI 弹 `ask_user_question`，`question-requested`）
-   - 服务终止时提示（mux 流断开 / `stream-error`）
+   - 服务终止时提示（连接断开，`stream-end`）
    - **子代理运行完成**（`subagent-complete`，任意子代理跑完）
    - **最后一个子代理运行完成**（`last-subagent-complete`，当前会话树内所有运行中的子代理全部完成）
 
 4. **供其他插件使用的 API**（`ctx.get("soundPlayer")` 或 `window.__dshSoundPlayer__`）
    - 导入音频：`importAudioFile(file)` / `importAudioFiles(files)` / `importAudioDir(files)`
-   - 增添情况：`addSituation({ label, trigger, audioId?, enabled? })` → 返回 id
+   - 增添情况：`addSituation({ label, trigger, audioId?, enabled?, volume? })` → 返回 id
    - 触发情况并播放音效：`triggerSituation(id)` / `trigger(id)`
-   - 修改情况：`setSituation(id, patch)`、`setSituationEnabled(id, b)`、`setSituationAudio(id, audioId)`、`removeSituation(id)`
-   - 其他：`listSounds()` / `listSoundsMeta()` / `deleteSound(id)` / `listSituations()` / `getState()` / `setEnabled` / `setVolume` / `setOnlyCurrentSession` / `subscribe(fn)` / `stopAll()`
+   - 修改情况：`setSituation(id, patch)`、`setSituationEnabled(id, b)`、`setSituationAudio(id, audioId)`、`setSituationVolume(id, v)`、`removeSituation(id)`
+   - 其他：`listSounds()` / `listSoundsMeta()` / `deleteSound(id)` / `listSituations()` / `getState()` / `setEnabled` / `setVolume`（兼容入口，批量写入所有情况，非全局音量）/ `setOnlyCurrentSession` / `subscribe(fn)` / `stopAll()`
 
 ## 触发方式（trigger）取值
 
@@ -126,6 +127,9 @@ dsh plugin add ./dsh-sound-player-0.2.0.tgz
   音效才会出声，插件会在首次交互时自动恢复 AudioContext。
 - 音频数据保存在 IndexedDB（`dsh-sound-player` 库），配置保存在 localStorage，
   均只对本机这份桌面端数据生效；清除客户端站点数据会清掉音效库。
+- 音量是**逐条绑定**的属性，随情况一起存在 localStorage 里；播放时只读这条绑定自身的
+  音量，没有任何全局音量参与。配置从 v2 升到 v3 时会自动把老的全局音量写进每条情况
+  作为初值（升级后响度不变），然后丢弃全局字段——升级不会重置你已调好的音效库。
 - 「服务终止」在连接代际消失（`generation` → `undefined`）或连接状态进入
   `disconnected` 时播放一次，带 5 秒防抖，避免重连抖动重复响。
 - 「子代理运行完成」通过 `sessions.list` 快照中 `origin === "subagent"` 行的
