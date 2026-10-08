@@ -262,7 +262,10 @@ window.__ModuleLoader__.load({
 					await this.resume();
 					if (!sound) return;
 					if (sound.kind === "synth" && Array.isArray(sound.recipe)) {
-						this.playRecipe(sound.recipe, volume);
+						// 同一个音效只保留一路发声：再次触发先掐掉上一路，
+						// 否则两条情况绑同一个音效时会叠成"多重音效"。
+						this.stopVoice(sound.id);
+						this.playRecipe(sound.recipe, volume, sound.id);
 						return;
 					}
 					if (!sound.dataUrl) return;
@@ -273,28 +276,27 @@ window.__ModuleLoader__.load({
 						buf = await c.decodeAudioData(ab);
 						this.cache.set(soundId, buf);
 					}
-					const prev = this.active.get(soundId);
-					if (prev) {
-						try { prev.stop(); } catch (err) { /* */ }
-					}
+					this.stopVoice(soundId);
 					const src = c.createBufferSource();
 					src.buffer = buf;
 					const g = c.createGain();
 					g.gain.value = clamp(volume == null ? DEFAULT_VOLUME : volume, 0, 1);
 					src.connect(g);
 					g.connect(this.master);
-					src.onended = () => this.active.delete(soundId);
+					const voice = { stop: () => { try { src.stop(); } catch (err) { /* */ } } };
+					src.onended = () => { if (this.active.get(soundId) === voice) this.active.delete(soundId); };
 					src.start();
-					this.active.set(soundId, src);
+					this.active.set(soundId, voice);
 				} catch (err) {
 					/* 解码或播放失败静默 */
 				}
 			},
-			playRecipe(recipe, volume) {
+			playRecipe(recipe, volume, soundId) {
 				const c = this.ensure();
 				if (!c) return;
 				const vol = clamp(volume == null ? DEFAULT_VOLUME : volume, 0, 1);
 				const now = c.currentTime;
+				const nodes = [];
 				for (const n of recipe) {
 					if (!n || !n.f) continue;
 					const t0 = now + (n.t || 0) / 1000;
@@ -311,11 +313,23 @@ window.__ModuleLoader__.load({
 					g.connect(this.master);
 					osc.start(t0);
 					osc.stop(t0 + dur + 0.05);
+					nodes.push(osc);
+				}
+				if (soundId && nodes.length) {
+					this.active.set(soundId, {
+						stop: () => { for (const o of nodes) { try { o.stop(); } catch (err) { /* */ } } }
+					});
 				}
 			},
+			stopVoice(soundId) {
+				const voice = this.active.get(soundId);
+				if (!voice) return;
+				this.active.delete(soundId);
+				try { voice.stop(); } catch (err) { /* */ }
+			},
 			stopAll() {
-				for (const s of this.active.values()) {
-					try { s.stop(); } catch (err) { /* */ }
+				for (const voice of Array.from(this.active.values())) {
+					try { voice.stop(); } catch (err) { /* */ }
 				}
 				this.active.clear();
 			}
@@ -343,6 +357,31 @@ window.__ModuleLoader__.load({
 
 		// #region 触发逻辑
 		let sessions = null;
+		// 抗重复（跨实例）：页面上只应存在一份运行时，但热更新 / 代际重挂时旧实例可能
+		// 没被收掉，于是同一个事件会被多份 watcher 各放一遍。这两个 window 槽位让
+		// 「已放过的 (会话, seq)」在整页范围内只算一次。
+		const RUNTIME_KEY = "__dshSoundPlayerRuntime__";
+		const SEEN_SEQ_KEY = "__dshSoundPlayerSeenSeq__";
+		function seenSeqStore() {
+			try {
+				let store = window[SEEN_SEQ_KEY];
+				if (!(store instanceof Map)) { store = new Map(); window[SEEN_SEQ_KEY] = store; }
+				if (store.size > 500) store.clear();
+				return store;
+			} catch (err) {
+				return null;
+			}
+		}
+		// 返回 true = 这个 seq 还没放过（可以响），false = 已经放过（丢弃）。
+		function claimEventSeq(sessionKey, seq) {
+			const store = seenSeqStore();
+			if (!store) return true;
+			const key = String(sessionKey);
+			const handled = store.get(key);
+			if (typeof handled === "number" && seq <= handled) return false;
+			store.set(key, seq);
+			return true;
+		}
 		// 会话列表快照形如 { byId: { [sessionId]: row }, phase }，**没有 `current` 字段**；
 		// DSH 客户端判定「当前会话」的约定是 retainedBy.mainView > 0 的那一行
 		// （主视图正在保留它，见 ui-workspace 的实现）。
@@ -449,7 +488,8 @@ window.__ModuleLoader__.load({
 						const ev = e && e.event;
 						if (!ev || typeof ev.seq !== "number" || ev.seq <= lastSeenSeq) continue;
 						if (ev.seq > max) max = ev.seq;
-						mapEvent(ev);
+						// 跨实例幂等：同一 (会话, seq) 在整页范围内只处理一次。
+						if (claimEventSeq(attachedId, ev.seq)) mapEvent(ev);
 					}
 					lastSeenSeq = Math.max(lastSeenSeq, max);
 				} else if (change.kind === "replace" || change.kind === "prepend") {
@@ -977,6 +1017,12 @@ window.__ModuleLoader__.load({
 		 * @param {import('@deepseek-ai/cordis').Context} ctx - 客户端 cordis 根上下文。
 		 */
 		function apply(ctx) {
+			// 单实例：本插件被重新挂载（热更新 / 连接代际重挂）时，先把上一份运行时
+			// 收干净。否则旧 watcher 仍订阅着事件窗口，同一个事件会被播放多次。
+			try {
+				const prev = window[RUNTIME_KEY];
+				if (prev && typeof prev.dispose === "function") prev.dispose();
+			} catch (err) { /* 忽略 */ }
 			sessions = ctx && ctx.sessions ? ctx.sessions : null;
 			ctx.provide("soundPlayer", soundPlayer);
 			try {
@@ -1021,7 +1067,11 @@ window.__ModuleLoader__.load({
 				try { if (disposeSubagent) disposeSubagent(); } catch (err) { /* */ }
 				try { if (typeof disposeQuestions === "function") disposeQuestions(); } catch (err) { /* */ }
 				try { if (disposeSettings) disposeSettings(); } catch (err) { /* */ }
+				try { engine.stopAll(); } catch (err) { /* */ }
+				try { if (window[RUNTIME_KEY] === runtime) delete window[RUNTIME_KEY]; } catch (err) { /* */ }
 			};
+			const runtime = { dispose };
+			try { window[RUNTIME_KEY] = runtime; } catch (err) { /* */ }
 			try {
 				ctx.on("dispose", dispose);
 			} catch (err) {

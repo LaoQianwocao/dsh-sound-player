@@ -33,6 +33,7 @@ const sig = (p) => p.map((x) => (x.kind === "file" ? "FILE" : x.f + "@" + x.t)).
 let GAINS = [];
 const takeGains = () => { const g = GAINS; GAINS = []; return g; };
 const peaks = (g) => g.filter((v) => v > 0.0002);
+let KILLED = 0; // immediate-voice kills (engine replacing a still-playing sound)
 
 const SYNTH = {
   "prompt-ding": "1046.5@0",
@@ -66,7 +67,8 @@ class OscStub {
   constructor() { this.type = "sine"; this.frequency = { value: 0 }; }
   connect() {}
   start(t) { PLAYED.push({ kind: "synth", f: this.frequency.value, t }); }
-  stop() {}
+  // stop() 无参 = 立即掐断（引擎在换音/停声时调用）；带时间 = 配方自己排的收尾。
+  stop(t) { if (t === undefined) KILLED += 1; }
 }
 class SrcStub { connect() {} start() { PLAYED.push({ kind: "file" }); } stop() {} }
 class AudioContextStub {
@@ -150,7 +152,7 @@ const mod = factory((n) => { if (n === "react") return React; throw new Error("u
 
 const listState = { byId: {}, phase: "ready" };
 const esState = { entries: [], change: { kind: "append", entries: [] } };
-let esListener = null, genListener = null, stateListener = null, questionListener = null;
+let esListeners = [], genListener = null, stateListener = null, questionListener = null;
 let listListeners = []; // both watchers subscribe independently
 const callList = () => { for (const cb of listListeners.slice()) cb(); };
 let gen = { id: 1 }, connState = "connected";
@@ -167,7 +169,12 @@ const sessions = {
       sessionId: id,
       eventSource: {
         getSnapshot: () => esState,
-        subscribe: (cb) => { esListener = cb; return () => { esListener = null; }; },
+        // 真实实现是 Set<listener>，支持多个订阅者，桩必须照此实现，
+        // 否则「旧实例未收」这类重复播放根本复现不出来。
+        subscribe: (cb) => {
+          esListeners.push(cb);
+          return () => { esListeners = esListeners.filter((x) => x !== cb); };
+        },
       },
     };
   },
@@ -199,11 +206,12 @@ const fail = (msg) => { failed += 1; results.push("FAIL  " + msg); };
 const ok = (msg) => results.push("ok    " + msg);
 
 let seq = 0;
+const notifyEventSource = () => { for (const cb of esListeners.slice()) cb(); };
 async function fireSessionEvent(type, data) {
   seq += 1;
   esState.change = { kind: "append", entries: [{ type: "event", event: { type, seq, data } }] };
-  if (!esListener) return fail("eventSource not subscribed -> attach failed");
-  esListener();
+  if (!esListeners.length) return fail("eventSource not subscribed -> attach failed");
+  notifyEventSource();
   await delay(30);
 }
 async function expect(label, wantSig) {
@@ -353,7 +361,37 @@ function report() {
     if (dup.length === 0) ok("stream-end debounced within 5s"); else fail("debounce failed: " + nameOf(dup));
   } else fail("connection.state not subscribed");
 
-  // 10) rendered settings page: one volume slider per binding item, no global one
+  // 10) duplicate delivery and stale runtimes must not double-play
+  // 10a) the same seq delivered again -> must stay silent
+  take(); takeGains();
+  notifyEventSource(); // same change object, same seq as the previous append
+  await delay(40);
+  if (take().length === 0) ok("re-delivering the same seq stays silent");
+  else fail("same seq replayed a sound");
+
+  // 10b) a stale runtime (HMR / generation remount) is disposed on re-apply
+  mod.apply(ctx);
+  await delay(40);
+  if (esListeners.length === 1) ok("re-apply disposes the stale runtime (1 event subscription)");
+  else fail("stale runtimes still subscribed: " + esListeners.length);
+  callList();
+  take(); takeGains();
+  await fireSessionEvent("turn/end", { turn: 9, reason: { kind: "completed" } });
+  await delay(30);
+  const afterReapply = take();
+  if (afterReapply.length === 4) ok("one event after re-apply -> exactly one sound");
+  else fail("one event after re-apply -> " + afterReapply.length + " voices (want 4)");
+
+  // 10c) the same sound never stacks onto itself
+  take(); KILLED = 0;
+  await board.triggerSituation("conversation-complete");
+  await delay(20);
+  await board.triggerSituation("conversation-complete");
+  await delay(20);
+  if (KILLED >= 4) ok("re-triggering one sound stops the previous voice (no stacking)");
+  else fail("previous voice not stopped: killed=" + KILLED);
+
+  // 11) rendered settings page: one volume slider per binding item, no global one
   function renderNodes(node, out) {
     if (node == null || node === false || node === true) return out;
     if (Array.isArray(node)) { for (const n of node) renderNodes(n, out); return out; }
