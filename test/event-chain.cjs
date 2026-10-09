@@ -18,7 +18,9 @@
  * Exit code is always 0; read the RESULT line (per-check ok/FAIL above it).
  */
 const fs = require("fs");
+const path = require("node:path");
 const vm = require("vm");
+const { pathToFileURL } = require("node:url");
 
 const target = process.argv[2];
 const code = fs.readFileSync(target, "utf8");
@@ -140,6 +142,10 @@ console.warn = (...a) => { warns.push(a.join(" ")); };
 
 vm.runInThisContext(code, { filename: target });
 
+// —— 先把宿主端接上：捕获它注册的 soundPlayer/* handler ——
+const hostModPromise = import(pathToFileURL(path.join(__dirname, "..", "lib", "index.js")).href);
+let hostHandler = null;
+
 // Minimal element tree instead of null, so the rendered settings page can be
 // asserted structurally (function components are invoked by renderNodes below).
 const React = {
@@ -182,6 +188,14 @@ const sessions = {
 const connection = {
   generation: { getSnapshot: () => gen, subscribe: (cb) => { genListener = cb; return () => {}; } },
   state: { getSnapshot: () => connState, subscribe: (cb) => { stateListener = cb; return () => {}; } },
+  // 音效库走真实的宿主端点：把 hostHandler 当作 RPC 传输层接上，
+  // 这样客户端测试读的是 sounds/ 里真实的文件。
+  rpc: {
+    call: async (channel, endpoint, payload) => {
+      if (!hostHandler) throw new Error("host handler 未注册");
+      return hostHandler(endpoint, payload);
+    },
+  },
 };
 const REGISTERED = []; // settings.section registrations, for the UI assertions
 const ctx = {
@@ -198,7 +212,8 @@ const ctx = {
   },
 };
 
-mod.apply(ctx);
+// apply 必须在宿主端 handler 就绪之后再调用（库树是从宿主端拉的），
+// 因此挪进下面的异步主体里。
 
 const results = [];
 let failed = 0;
@@ -240,6 +255,20 @@ function report() {
 }
 
 (async () => {
+  // 先把宿主端挂上并捕获它的 soundPlayer/* handler，再 apply 客户端。
+  const hostMod = await hostModPromise;
+  hostMod.apply({
+    get: (k) => (k === "connection" ? {
+      rpc: { intercept: (channel, matches, h) => { hostHandler = h; return async () => { hostHandler = null; }; } },
+    } : undefined),
+    on: () => {},
+  });
+  if (typeof hostHandler !== "function") { fail("宿主端 handler 未注册"); report(); return; }
+  ok("宿主端 soundPlayer/* handler 已接到客户端 RPC 传输层");
+
+  mod.apply(ctx);
+  await delay(60); // 等 refreshLibrary() 完成
+
   // 0) no session yet -> must not attach
   callList();
   if (boundIds.length === 0) ok("no current session -> no attach"); else fail("attached without session: " + boundIds.join(","));
@@ -265,6 +294,36 @@ function report() {
   else fail("getState() still exposes onlyCurrentSession = " + board.getState().onlyCurrentSession);
   if (board.setOnlyCurrentSession === undefined) ok("setOnlyCurrentSession removed from the API");
   else fail("setOnlyCurrentSession is still part of the public API");
+  // v4 -> v5：内置 id 迁移成库内路径
+  if (conv && conv.audioId === "默认音效库/合成音效/完成音（上扬）.json") ok("migration: builtin id -> library path");
+  else fail("migration: conversation-complete audioId = " + (conv && conv.audioId));
+
+  // 1b) 音效库（真实文件，经宿主端 handler 读回）
+  const tree = board.getLibraryTree();
+  const libNames = tree ? tree.children.map((d) => d.name) : [];
+  if (["默认音效库", "自定义音效库", "神人音效库"].every((n) => libNames.includes(n))) ok("库树含三个库: " + libNames.join(" / "));
+  else fail("库树缺库: " + libNames.join(" / "));
+  const flatten = (nodes, out) => {
+    const acc = out || [];
+    for (const n of nodes || []) { if (n.type === "dir") flatten(n.children, acc); else acc.push(n); }
+    return acc;
+  };
+  const tops = tree ? tree.children : [];
+  const shenCount = flatten(tops.filter((d) => d.name === "神人音效库")).length;
+  const defLib = tops.find((d) => d.name === "默认音效库");
+  const defSounds = flatten(defLib ? [defLib] : []);
+  const synthCount = defSounds.filter((n) => n.type === "synth").length;
+  const audioCount = defSounds.filter((n) => n.type === "audio").length;
+  const cusCount = flatten(tops.filter((d) => d.name === "自定义音效库")).length;
+  if (shenCount === 34) ok("神人音效库 34 个音效可读");
+  else fail("神人音效库条目数 = " + shenCount);
+  if (synthCount === 8 && audioCount === 3) ok("默认音效库 = 8 个合成配方 + 3 个系统提示音");
+  else fail("默认音效库结构异常: synth=" + synthCount + " audio=" + audioCount);
+  if (cusCount === 0) ok("自定义音效库初始为空");
+  else fail("自定义音效库初始应为空，实际 " + cusCount);
+  const multiLevel = tops.find((d) => d.name === "默认音效库");
+  if (multiLevel && multiLevel.children.every((c) => c.type === "dir")) ok("默认音效库是多级结构（合成音效 / Windows 系统提示音）");
+  else fail("默认音效库不是多级结构");
 
   // 2) turn end
   await fireSessionEvent("turn/end", { turn: 1, reason: { kind: "completed" } });
@@ -412,18 +471,39 @@ function report() {
   }
   if (!REGISTERED.length) fail("settings.section was never registered");
   else {
-    const tree = React.createElement(REGISTERED[0].component, { board });
-    const nodes = renderNodes(tree, []);
-    const texts = renderTexts(tree, []);
+    const uiTree = React.createElement(REGISTERED[0].component, { board });
+    const nodes = renderNodes(uiTree, []);
+    const texts = renderTexts(uiTree, []);
+    const count = board.listSituations().length;
     const sliders = nodes.filter((n) => n.type === "input" && n.props.type === "range");
     const perItem = sliders.filter((n) => typeof n.props.title === "string" && n.props.title.indexOf("这条情况") >= 0);
-    const count = board.listSituations().length;
-    if (sliders.length === count && perItem.length === count) {
-      ok("UI: " + count + " per-item volume sliders and no global slider");
-    } else fail("UI: " + sliders.length + " sliders / " + perItem.length + " per-item (expect " + count + ")");
-    if (texts.includes("总开关") && !texts.some((t) => t.indexOf("总开关与音量") >= 0)) {
-      ok("UI: global volume row removed from the switch section");
-    } else fail("UI: switch section title still mentions volume");
+    if (sliders.length === count && perItem.length === count) ok("UI: " + count + " per-item volume sliders and no global slider");
+    else fail("UI: " + sliders.length + " sliders / " + perItem.length + " per-item (expect " + count + ")");
+    if (texts.includes("总开关") && !texts.some((t) => t.indexOf("总开关与音量") >= 0)) ok("UI: global volume row removed from the switch section");
+    else fail("UI: switch section title still mentions volume");
+
+    // 音效选择器：每条绑定一个，按钮上显示当前绑定的短名
+    const pickers = nodes.filter((n) => typeof n.props.className === "string" && n.props.className.indexOf("dsp-picker") === 0);
+    if (pickers.length === count) ok("UI: " + count + " cascading sound pickers");
+    else fail("UI: " + pickers.length + " pickers (expect " + count + ")");
+    const pickerBtns = nodes.filter((n) => typeof n.props.className === "string" && n.props.className.indexOf("dsp-picker-btn") >= 0);
+    if (pickerBtns.length === count) ok("UI: picker buttons rendered per binding");
+    else fail("UI: " + pickerBtns.length + " picker buttons (expect " + count + ")");
+    const firstLabel = pickerBtns.length ? renderTexts(pickerBtns[0].children ? { type: "div", props: {}, children: pickerBtns[0].children } : null, []) : [];
+    if (firstLabel.join("").indexOf("完成音（上扬）") >= 0) ok("UI: picker button shows the bound sound short name");
+    else fail("UI: picker button label = " + JSON.stringify(firstLabel.join("")));
+
+    // 音效库导入区不再列出音效，改为三个按钮
+    const sndRows = nodes.filter((n) => typeof n.props.className === "string" && n.props.className.indexOf("dsp-snd-row") >= 0);
+    if (sndRows.length === 0) ok("UI: import section no longer lists sounds");
+    else fail("UI: import section still renders " + sndRows.length + " sound rows");
+    const btnTexts = nodes
+      .filter((n) => n.type === "button")
+      .map((n) => renderTexts({ type: "div", props: {}, children: n.children || [] }, []).join(""));
+    for (const want of ["导入音效", "导入文件夹", "打开音效库"]) {
+      if (btnTexts.some((t) => t.indexOf(want) >= 0)) ok("UI: import section has 「" + want + "」");
+      else fail("UI: import section missing 「" + want + "」");
+    }
   }
 
   report();

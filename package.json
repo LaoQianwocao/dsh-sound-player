@@ -16,7 +16,9 @@
   "files": [
     "lib/index.js",
     "client.js",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "sounds/默认音效库",
+    "sounds/神人音效库"
   ],
   "dsh": {
     "bundle": {

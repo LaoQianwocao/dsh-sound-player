@@ -14,13 +14,21 @@
 1. **设置页音效播放器**（设置 → 音效播放器）
    - 总开关（**只有总开关**：没有全局音量，也没有「仅当前会话响铃」）；
    - 为每种「情况」绑定音效并开关，显示格式如 `【√】发送消息时播放【提示音1】`；
+   - **级联式音效选择器**：下拉里是三个音效库，鼠标悬停文件夹即在右侧展开内容，
+     子文件夹继续向右展开（支持任意层级）；
    - **每条绑定下方各有自己的音量滑块**，互不影响——对话完成可以响亮、子代理完成可以很轻；
-   - 导入音频：选择文件 / 选择文件夹 / 拖拽音频到设置页。
+   - 导入音频：导入音效 / 导入文件夹（写入「自定义音效库」，文件夹导入保留子目录结构），
+     也可把音频拖到设置页；
+   - **打开音效库**：在文件管理器里打开库目录，可直接改名、加子文件夹、删文件。
 
-2. **内置默认音效**（开箱即用，七种默认情况已预绑定）
-   - **合成音效（免费、无版权，Web Audio 实时生成）**：提示音1（叮）、提示音2（双叮）、完成音（上扬）、通知音（钟声）、询问音、成功音（和弦）、警告音、停止音（下行）；
-   - **内嵌 Windows 系统提示音**：系统提示音·叮（ding.wav）、系统提示音·启动（Windows Startup.wav）、系统提示音·默认（Windows Default.wav）；
-   - 内置音效标记为 `[合成]` / `[系统]`，不可删除，随时可重新绑定。
+2. **三个音效库（都是插件包内的真实文件夹，随包分发）**
+   - `默认音效库` — 内置合成音效（8 个 `*.json` Web Audio 配方）+ Windows 系统提示音（3 个 `*.wav`）；
+   - `神人音效库` — 34 个内置 meme / 游戏音效，已按中文社区通用叫法重命名
+     （原始文件名、出处与置信度见 [`sounds/神人音效库/命名对照.md`](sounds/神人音效库/命名对照.md)）；
+   - `自定义音效库` — 使用者导入的音效（本机数据，不入 git）；
+   - 三个库都由宿主端（`lib/index.js`）读取，客户端经已认证的 RPC 通道取字节并按需解码缓存；
+     内置两库不可删，自定义库可在选择器里直接删。
+   - 默认的 7 种情况仍绑定原来的内置音效，开箱即用。
 
 3. **内置情况**
    - 对话完成提示（`turn-end`）
@@ -32,11 +40,14 @@
    - **最后一个子代理运行完成**（`last-subagent-complete`，所有会话中运行中的子代理全部完成）
 
 4. **供其他插件使用的 API**（`ctx.get("soundPlayer")` 或 `window.__dshSoundPlayer__`）
-   - 导入音频：`importAudioFile(file)` / `importAudioFiles(files)` / `importAudioDir(files)`
+   - 导入音频：`importAudioFile(file)` / `importAudioFiles(files)` / `importAudioDir(files)`（一律写入自定义音效库）
+   - 音效库：`getLibraryTree()` / `refreshLibrary()` / `openLibrary(path?)` / `listSounds()` / `listSoundsMeta()` / `previewSound(path)` / `deleteSound(path)`（仅自定义库）
    - 增添情况：`addSituation({ label, trigger, audioId?, enabled?, volume? })` → 返回 id
    - 触发情况并播放音效：`triggerSituation(id)` / `trigger(id)`
    - 修改情况：`setSituation(id, patch)`、`setSituationEnabled(id, b)`、`setSituationAudio(id, audioId)`、`setSituationVolume(id, v)`、`removeSituation(id)`
-   - 其他：`listSounds()` / `listSoundsMeta()` / `deleteSound(id)` / `listSituations()` / `getState()` / `setEnabled` / `setVolume`（兼容入口，批量写入所有情况，非全局音量）/ `subscribe(fn)` / `stopAll()`
+   - 其他：`listSituations()` / `getState()` / `setEnabled` / `setVolume`（兼容入口，批量写入所有情况，非全局音量）/ `subscribe(fn)` / `stopAll()`
+   - 注意：`audioId` / `path` 现在是**库内相对路径**（例如 `神人音效库/哈基米.mp3`），
+     不再是 v4 及以前的内置 id（老配置会自动迁移）。
 
 ## 触发方式（trigger）取值
 
@@ -112,25 +123,57 @@ dsh plugin add ./dsh-sound-player-0.2.0.tgz
 
 - `package.json` — 声明 `dsh.client`（`platform: "web"`，桌面端加载的就是这套客户端 bundle，不是分发渠道）与 `dsh.bundle`（自注册行）
 - `cordis.patch.yml` — 注册本插件的宿主端行（plugin row）
-- `lib/index.js` — 宿主端（Node half）占位
-- `client.js` — 客户端全部功能（存储 / 音效引擎 / 事件监听 / API / 设置页 UI），随桌面端渲染进程运行；无悬浮窗
-- `test/event-chain.cjs` — 无头自检：桩化客户端运行时，断言 7 类触发是否真的接通
+- `lib/index.js` — 宿主端：音效库的读取/导入/删除/打开端点，注册在已认证的共享 RPC 通道（`/api`）上
+- `client.js` — 客户端全部功能（音效库消费 / 音效引擎 / 事件监听 / API / 设置页 UI），随桌面端渲染进程运行；无悬浮窗
+- `sounds/默认音效库/` — 内置合成音效（`合成音效/*.json`）与 Windows 提示音（`Windows 系统提示音/*.wav`）
+- `sounds/神人音效库/` — 34 个内置 meme / 游戏音效（`命名对照.md` 记录原名与出处）
+- `sounds/自定义音效库/` — 使用者导入的音效（本机数据，已 gitignore；目录缺失时自动创建）
+- `test/library-host.cjs` — 宿主端端点无头测试（目录树 / 读取 / 导入去冲突 / 路径越界 / 删除限制）
+- `test/event-chain.cjs` — 客户端无头自检：把真实宿主 handler 当 RPC 传输层接上，断言 7 类触发、
+  逐条音量、抗重复、级联选择器结构
 
 ## 客户端前置（inject）
 
 `dsh.client.inject` 声明的包级依赖为：
 `@deepseek-ai/dsh-client-connection`、`@deepseek-ai/dsh-client-runtime`。
 运行时服务依赖（`exports.inject`）：`connection`、`sessions`、`slots`。
+宿主端不硬依赖任何服务：拿不到 `ctx.connection.rpc.intercept` 时只是不暴露库端点，
+客户端会显示「音效库不可用」并静默降级。
 
 ## 注意事项
 
 - 自动播放策略（桌面端渲染进程沿用 Chromium 策略）：需要界面有过一次鼠标/键盘交互后
   音效才会出声，插件会在首次交互时自动恢复 AudioContext。
-- 音频数据保存在 IndexedDB（`dsh-sound-player` 库），配置保存在 localStorage，
-  均只对本机这份桌面端数据生效；清除客户端站点数据会清掉音效库。
-- 音量是**逐条绑定**的属性，随情况一起存在 localStorage 里；播放时只读这条绑定自身的
-  音量，没有任何全局音量参与。配置从 v2 升到 v3 时会自动把老的全局音量写进每条情况
-  作为初值（升级后响度不变），然后丢弃全局字段——升级不会重置你已调好的音效库。
+- **音效库就是插件目录里的真实文件**：绑定下拉里浏览 `sounds/` 下的三个库，容量、
+  改名、加子文件夹都直接用文件管理器操作（设置页「打开音效库」一键打开）。
+  音乐文件以 MP3/WAV/OGG 等常见格式放在库里即可；`默认音效库/合成音效/*.json`
+  是 Web Audio 配方，手改里面的音符参数就能自定义合成音。
+- **导入的音效落到 `sounds/自定义音效库/`**，导入文件夹会保留子目录结构；重名自动加
+  `-2` 后缀。该目录已 gitignore——它属于本机数据，不会被推到仓库。
+- 配置仍然只存在 localStorage：每条绑定的音效（库内相对路径）、音量、开关。
+  配置 v4 → v5 会把老的内置 id 自动换成库内路径；旧版存在浏览器 IndexedDB 里的
+  导入音效会在首次启动时搬到「自定义音效库」，只做一次。
+- 音量是**逐条绑定**的属性；播放时只读这条绑定自身的音量，没有任何全局音量参与。
+  配置从 v2 升到 v3 时会自动把老的全局音量写进每条情况作为初值（升级后响度不变）。
+- 「服务终止」在连接代际消失（`generation` → `undefined`）或连接状态进入
+  `disconnected` 时播放一次，带 5 秒防抖，避免重连抖动重复响。
+- 「子代理运行完成」通过 `sessions.list` 快照中 `origin === "subagent"` 行的
+  `running` 状态翻转检测；「最后一个子代理运行完成」在**所有会话**中运行中的
+  子代理数量从 ≥1 降到 0 时触发。父会话字段同时兼容 `parentSessionId`（Host 摘要）
+  与 `parentId` 两种命名。
+- 不再按会话过滤：插件已取消「仅当前会话响铃」设置，后台会话、其它会话触发的情况
+  同样会响铃（配置 v3 → v4 会丢弃老的该字段）。实时事件仍来自当前会话的事件窗口，
+  子代理检测则覆盖全部会话。
+- **同一个音效同一时刻只保留一路发声**：再次触发会先掐掉上一路。所以把两条情况绑到
+  同一个音效时不会叠成「多重音效」；想要叠加效果就给它们绑不同的音效。
+- **抗重复播报**（两层防御）：① 插件在页面级做单实例收编——重新挂载（热更新 / 连接
+  代际重挂）时先收掉上一份运行时，避免旧 watcher 继续订阅事件窗口；② 对
+  `(会话, seq)` 做全页幂等，同一个事件即使被重复投递也只响一次。
+  `test/event-chain.cjs` 里有对应用例（旧实现会一次事件响 2 遍）。
+- `sessions.list` 与 `connection.generation` 属于客户端运行时的内部快照存储，
+  未出现在官方客户端服务契约（cordis-inspect 目录）里。插件对它们的读取都做了
+  判空与 `try/catch`：接口缺失时静默降级，不影响其他功能。桌面端升级后建议重跑
+  `test/event-chain.cjs` 与 `test/library-host.cjs` 确认契约未变。
 - 「服务终止」在连接代际消失（`generation` → `undefined`）或连接状态进入
   `disconnected` 时播放一次，带 5 秒防抖，避免重连抖动重复响。
 - 「子代理运行完成」通过 `sessions.list` 快照中 `origin === "subagent"` 行的
