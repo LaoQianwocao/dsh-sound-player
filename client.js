@@ -89,7 +89,7 @@ window.__ModuleLoader__.load({
 		];
 		function defaultConfig() {
 			return {
-				v: 5,
+				v: 6,
 				enabled: true,
 				situations: deepClone(DEFAULT_SITUATIONS)
 			};
@@ -136,6 +136,14 @@ window.__ModuleLoader__.load({
 				// 是包内 sounds/ 下的真实文件）。旧 id 一律换成对应路径。
 				for (const s of cfg.situations) {
 					if (s.audioId && BUILTIN_AUDIO_PATH[s.audioId]) s.audioId = BUILTIN_AUDIO_PATH[s.audioId];
+				}
+				// 迁移 v5 -> v6：每条情况新增「播放区间 + 特效」。
+				// clipStart/clipEnd 单位毫秒，clipEnd 为 null 表示播到结尾；effect 目前只有
+				// "fade-out"（渐弱消失），null 表示无特效。
+				for (const s of cfg.situations) {
+					s.clipStart = typeof s.clipStart === "number" && s.clipStart >= 0 ? Math.round(s.clipStart) : 0;
+					s.clipEnd = typeof s.clipEnd === "number" && s.clipEnd > 0 ? Math.round(s.clipEnd) : null;
+					s.effect = s.effect === "fade-out" ? "fade-out" : null;
 				}
 				cfg.v = base.v;
 				return cfg;
@@ -350,34 +358,44 @@ window.__ModuleLoader__.load({
 					/* 忽略 */
 				}
 			},
-			async play(sound, volume) {
+			/**
+			 * 播放一条音效。
+			 * @param {object} sound - { id, kind: "synth"|"buffer", recipe?, buffer? }
+			 * @param {object} [options] - { volume, clipStart, clipEnd, effect }（毫秒）
+			 * @returns {Promise<object|null>} 声部句柄 { soundId, stop(), ended }；无法播放时 null。
+			 */
+			async play(sound, options) {
 				try {
 					const c = this.ensure();
-					if (!c) return;
+					if (!c) return null;
 					await this.resume();
-					if (!sound) return;
-					if (sound.kind === "synth" && Array.isArray(sound.recipe)) {
-						// 同一个音效只保留一路发声：再次触发先掐掉上一路，
-						// 否则两条情况绑同一个音效时会叠成"多重音效"。
-						this.stopVoice(sound.id);
-						this.playRecipe(sound.recipe, volume, sound.id);
-						return;
-					}
-					if (!sound.buffer) return;
-					const soundId = sound.id;
-					this.stopVoice(soundId);
-					const src = c.createBufferSource();
-					src.buffer = sound.buffer;
-					const g = c.createGain();
-					g.gain.value = clamp(volume == null ? DEFAULT_VOLUME : volume, 0, 1);
-					src.connect(g);
-					g.connect(this.master);
-					const voice = { stop: () => { try { src.stop(); } catch (err) { /* */ } } };
-					src.onended = () => { if (this.active.get(soundId) === voice) this.active.delete(soundId); };
-					src.start();
-					this.active.set(soundId, voice);
+					if (!sound) return null;
+					const opts = options || {};
+					const volume = clamp(opts.volume == null ? DEFAULT_VOLUME : opts.volume, 0, 1);
+					const totalMs = this.durationMs(sound);
+					let startMs = Math.max(0, Number(opts.clipStart) || 0);
+					if (totalMs > 0 && startMs >= totalMs) startMs = 0; // 起点越界按全曲处理
+					// 终点未给、非数字或超长都按全曲；终点必须大于起点。
+					let endMs = opts.clipEnd == null || !isFinite(Number(opts.clipEnd))
+						? totalMs
+						: Math.min(Number(opts.clipEnd), totalMs > 0 ? totalMs : Number(opts.clipEnd));
+					if (!(endMs > startMs)) endMs = totalMs > startMs ? totalMs : startMs + 1;
+					const fade = opts.effect === "fade-out";
+					const self = this;
+					// 同一个音效只保留一路发声：再次触发先掐掉上一路，
+					// 否则两条情况绑同一个音效时会叠成"多重音效"。
+					this.stopVoice(sound.id);
+					const voice = sound.kind === "synth" && Array.isArray(sound.recipe)
+						? this.playRecipe(sound.recipe, volume, startMs, endMs, fade)
+						: this.playBuffer(sound, volume, startMs, endMs, fade);
+					if (!voice) return null;
+					voice.soundId = sound.id;
+					// 播完自动摘掉，避免 active 里留下已结束的声部。
+					voice.ended.then(() => { if (self.active.get(sound.id) === voice) self.active.delete(sound.id); });
+					this.active.set(sound.id, voice);
+					return voice;
 				} catch (err) {
-					/* 解码或播放失败静默 */
+					return null; // 解码或播放失败静默
 				}
 			},
 			/** 解码一段音频字节为 AudioBuffer（供音效库按需解码）。 */
@@ -386,41 +404,118 @@ window.__ModuleLoader__.load({
 				if (!c) throw new Error("AudioContext 不可用");
 				return c.decodeAudioData(arrayBuffer);
 			},
-			playRecipe(recipe, volume, soundId) {
-				const c = this.ensure();
-				if (!c) return;
-				const vol = clamp(volume == null ? DEFAULT_VOLUME : volume, 0, 1);
+			/** 音效总时长（毫秒）：音频看 buffer.duration，配方看最后一个音符的收尾。 */
+			durationMs(sound) {
+				if (!sound) return 0;
+				if (sound.kind === "synth" && Array.isArray(sound.recipe)) {
+					let max = 0;
+					for (const n of sound.recipe) {
+						if (!n || !n.f) continue;
+						max = Math.max(max, (n.t || 0) + (n.d || 200));
+					}
+					return max;
+				}
+				if (sound.buffer && isFinite(sound.buffer.duration)) return Math.round(sound.buffer.duration * 1000);
+				return 0;
+			},
+			/**
+			 * 造一个声部：一个总增益（承担音量与「渐弱消失」），加一组可停的节点。
+			 * @param {AudioContext} c - 音频上下文。
+			 * @param {number} baseGain - 该声部的稳态增益（音频走音量，配方音量已烘进音符故为 1）。
+			 * @param {number} spanMs - 本次播放的时长（毫秒）。
+			 * @param {boolean} fade - 是否在末尾渐弱到 0。
+			 */
+			newVoice(c, baseGain, spanMs, fade) {
+				const gain = c.createGain();
+				gain.connect(this.master);
 				const now = c.currentTime;
+				const spanSec = Math.max(0.01, spanMs / 1000);
+				gain.gain.value = baseGain;
+				if (fade) {
+					// 渐弱消失：末尾把总增益线性拉到 0（最长 400ms，最短 60ms）。
+					const fadeSec = Math.min(0.4, Math.max(0.06, spanSec * 0.25));
+					const at = now + Math.max(0, spanSec - fadeSec);
+					gain.gain.setValueAtTime(baseGain, at);
+					gain.gain.linearRampToValueAtTime(0.0001, now + spanSec);
+				}
 				const nodes = [];
+				let done = false;
+				let timer = null;
+				let resolveEnded;
+				const ended = new Promise((resolve) => { resolveEnded = resolve; });
+				const finish = () => {
+					if (done) return;
+					done = true;
+					if (timer) clearTimeout(timer);
+					try { gain.disconnect(); } catch (err) { /* */ }
+					resolveEnded();
+				};
+				timer = setTimeout(finish, spanMs + 80);
+				return {
+					gain,
+					nodes,
+					ended,
+					stop() {
+						for (const node of nodes) {
+							try { node.stop(); } catch (err) { /* */ }
+						}
+						finish();
+					}
+				};
+			},
+			playBuffer(sound, volume, startMs, endMs, fade) {
+				const c = this.ensure();
+				if (!c || !sound.buffer) return null;
+				const voice = this.newVoice(c, volume, endMs - startMs, fade);
+				const src = c.createBufferSource();
+				src.buffer = sound.buffer;
+				src.connect(voice.gain);
+				voice.nodes.push(src);
+				src.start(c.currentTime, startMs / 1000, Math.max(0.001, (endMs - startMs) / 1000));
+				return voice;
+			},
+			playRecipe(recipe, volume, startMs, endMs, fade) {
+				const c = this.ensure();
+				if (!c) return null;
+				const voice = this.newVoice(c, 1, endMs - startMs, fade);
+				const now = c.currentTime;
 				for (const n of recipe) {
 					if (!n || !n.f) continue;
-					const t0 = now + (n.t || 0) / 1000;
-					const dur = (n.d || 200) / 1000;
+					const noteStart = n.t || 0;
+					const noteDur = n.d || 200;
+					if (noteStart >= endMs) continue; // 落在区间之后
+					if (noteStart + noteDur <= startMs) continue; // 落在区间之前
+					// 音符与裁剪区间求交：区间前被切掉的部分从 0 时刻补上，区间后被截断。
+					const from = Math.max(noteStart, startMs);
+					const to = Math.min(noteStart + noteDur, endMs);
+					const t0 = now + (from - startMs) / 1000;
+					const dur = (to - from) / 1000;
+					if (!(dur > 0)) continue;
 					const osc = c.createOscillator();
 					osc.type = n.w || "sine";
 					osc.frequency.value = n.f;
 					const g = c.createGain();
-					const peak = Math.max(Math.min((n.g == null ? 0.4 : n.g) * vol, 1), 0.0001);
+					const peak = Math.max(Math.min((n.g == null ? 0.4 : n.g) * volume, 1), 0.0001);
 					g.gain.setValueAtTime(0.0001, t0);
-					g.gain.exponentialRampToValueAtTime(peak, t0 + 0.012);
+					g.gain.exponentialRampToValueAtTime(peak, t0 + Math.min(0.012, dur / 2));
 					g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
 					osc.connect(g);
-					g.connect(this.master);
+					g.connect(voice.gain);
 					osc.start(t0);
 					osc.stop(t0 + dur + 0.05);
-					nodes.push(osc);
+					voice.nodes.push(osc);
 				}
-				if (soundId && nodes.length) {
-					this.active.set(soundId, {
-						stop: () => { for (const o of nodes) { try { o.stop(); } catch (err) { /* */ } } }
-					});
-				}
+				if (!voice.nodes.length) { voice.stop(); return null; }
+				return voice;
 			},
 			stopVoice(soundId) {
 				const voice = this.active.get(soundId);
 				if (!voice) return;
 				this.active.delete(soundId);
 				try { voice.stop(); } catch (err) { /* */ }
+			},
+			isPlaying(soundId) {
+				return this.active.has(soundId);
 			},
 			stopAll() {
 				for (const voice of Array.from(this.active.values())) {
@@ -528,18 +623,53 @@ window.__ModuleLoader__.load({
 			if (!sit || !sit.audioId) return;
 			await playSituation(sit.id);
 		}
+		/** 按一条情况的设置播放它的音效，返回声部句柄（供试听按钮跟踪播放状态）。 */
+		async function playSituationVoice(sit) {
+			const sound = await loadSound(sit.audioId);
+			return engine.play(sound, {
+				volume: typeof sit.volume === "number" ? sit.volume : DEFAULT_VOLUME,
+				clipStart: sit.clipStart,
+				clipEnd: sit.clipEnd,
+				effect: sit.effect
+			});
+		}
 		async function playSituation(sitId) {
 			const sit = config.situations.find((s) => s.id === sitId);
 			if (!sit || !sit.enabled || !sit.audioId) return false;
 			if (!config.enabled) return false;
 			try {
 				// 绑定的就是库内路径：按需从宿主端取一次并缓存。
-				const sound = await loadSound(sit.audioId);
-				// 音量只来自这条绑定自身，没有全局音量参与。
-				await engine.play(sound, typeof sit.volume === "number" ? sit.volume : DEFAULT_VOLUME);
+				await playSituationVoice(sit);
 				return true;
 			} catch (err) {
 				return false; // 文件缺失 / 宿主端不可用：静默降级
+			}
+		}
+		// —— 试听：独立于总开关与单条开关，且同一时刻只留一路 ——
+		let previewVoice = null;
+		function trackPreview(voice) {
+			if (!voice) return null;
+			previewVoice = voice;
+			voice.ended.then(() => { if (previewVoice === voice) previewVoice = null; });
+			return voice;
+		}
+		function stopPreview() {
+			const voice = previewVoice;
+			previewVoice = null;
+			if (voice) {
+				try { voice.stop(); } catch (err) { /* 忽略 */ }
+			}
+			return true;
+		}
+		/** 试听某条情况的音效（含裁剪区间与特效），不动开关状态。 */
+		async function previewSituation(sitId) {
+			const sit = config.situations.find((s) => s.id === sitId);
+			if (!sit || !sit.audioId) return null;
+			stopPreview();
+			try {
+				return trackPreview(await playSituationVoice(sit));
+			} catch (err) {
+				return null;
 			}
 		}
 		// #endregion
@@ -741,9 +871,23 @@ window.__ModuleLoader__.load({
 			getLibraryTree() { return libraryTree; },
 			listSounds() { return Promise.resolve(listLibrarySounds()); },
 			listSoundsMeta() { return Promise.resolve(listLibrarySounds()); },
-			/** 试听库里的某个音效（不动任何绑定）。 */
-			previewSound(path) {
-				return loadSound(path).then((sound) => engine.play(sound)).catch(() => false);
+			/** 试听库里的某个音效（完整播放，不动任何绑定）。 */
+			async previewSound(path) {
+				stopPreview();
+				try {
+					return trackPreview(await engine.play(await loadSound(path), {}));
+				} catch (err) {
+					return null;
+				}
+			},
+			/** 试听某条情况的音效：带该条的裁剪区间 / 音量 / 特效，可被 stopPreview 打断。 */
+			previewSituation,
+			/** 停止当前试听（试听按钮的「停止」）。 */
+			stopPreview,
+			/** 取一条音效的时长（毫秒），供播放区间输入框与「全播放」复位使用。 */
+			async getSoundInfo(path) {
+				const sound = await loadSound(path);
+				return { path, kind: sound.kind, duration: engine.durationMs(sound) };
 			},
 			deleteSound: async (id) => {
 				const path = String(id == null ? "" : id);
@@ -848,6 +992,14 @@ window.__ModuleLoader__.load({
 .dsp-sit-row { display: flex; align-items: center; gap: 8px; }
 .dsp-vol-row { display: flex; align-items: center; gap: 8px; padding: 3px 0 0 42px; }
 .dsp-vol-row .dsp-range { max-width: 220px; }
+/* —— 【设置】展开的调整面板 —— */
+.dsp-panel { margin: 6px 0 2px 42px; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l2, rgba(255,255,255,.1)); border-radius: 10px; background: var(--dsw-alias-bg-layer-1, rgba(255,255,255,.03)); }
+.dsp-panel-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; flex-wrap: wrap; }
+.dsp-panel-label { flex: none; color: var(--dsw-alias-label-tertiary, #9ca3af); font-size: 12px; min-width: 54px; }
+.dsp-panel .dsp-range { max-width: 200px; }
+.dsp-num { width: 88px; }
+.dsp-btn.dsp-stop { background: var(--dsw-alias-state-error-primary, #dc2626); border-color: var(--dsw-alias-state-error-primary, #dc2626); color: #fff; }
+.dsp-btn.dsp-stop:hover { background: #b91c1c; }
 .dsp-sit-label { flex: 1; min-width: 0; line-height: 1.3; }
 .dsp-sit-label .dsp-sit-name { display: block; }
 .dsp-sit-label .dsp-sit-trigger { font-size: 11px; color: var(--dsw-alias-label-tertiary, #6b7280); }
@@ -1001,8 +1153,56 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		function SituationRow({ sit, tree, onChange, onRemove, onTest, onVolume, onPreview, onDeleteSound }) {
+		/**
+		 * 一条「情况」的绑定行。
+		 * 行上：开关 + 名称 + 音效选择器 + 【设置】。点【设置】在下方展开调整面板：
+		 * 音量、播放起点/终点（毫秒，默认全播放）、特效（渐弱消失）、【试听】。
+		 */
+		function SituationRow({ sit, tree, onChange, onRemove, onVolume, onPreview, onStopPreview, onDeleteSound, getSoundInfo }) {
+			const [open, setOpen] = React.useState(false);
+			const [duration, setDuration] = React.useState(0);
+			const [playing, setPlaying] = React.useState(false);
+			const [busy, setBusy] = React.useState(false);
 			const vol = typeof sit.volume === "number" ? sit.volume : DEFAULT_VOLUME;
+			const clipStart = typeof sit.clipStart === "number" ? sit.clipStart : 0;
+			const clipEnd = typeof sit.clipEnd === "number" ? sit.clipEnd : null;
+
+			// 展开时（或换了音效后）取一次时长，用于「全播放」与区间上限提示。
+			React.useEffect(() => {
+				if (!open || !sit.audioId) { setDuration(0); return; }
+				let alive = true;
+				Promise.resolve(getSoundInfo(sit.audioId))
+					.then((info) => { if (alive && info) setDuration(info.duration || 0); })
+					.catch(() => { if (alive) setDuration(0); });
+				return () => { alive = false; };
+			}, [open, sit.audioId]);
+
+			const togglePreview = () => {
+				if (playing) {
+					onStopPreview();
+					setPlaying(false);
+					return;
+				}
+				setBusy(true);
+				Promise.resolve(onPreview())
+					.then((voice) => {
+						setBusy(false);
+						if (!voice) return;
+						setPlaying(true);
+						// 自然播完（或被别的试听顶掉）后按钮复位。
+						Promise.resolve(voice.ended).then(() => setPlaying(false));
+					})
+					.catch(() => setBusy(false));
+			};
+
+			const startText = String(clipStart);
+			const endText = clipEnd == null ? "" : String(clipEnd);
+			const commitNumber = (key, raw, fallback) => {
+				const n = Number(raw);
+				if (raw === "" || !isFinite(n) || n < 0) onChange({ [key]: fallback });
+				else onChange({ [key]: Math.round(n) });
+			};
+
 			return h("div", { className: "dsp-sit-block" },
 				h("div", { className: "dsp-sit-row" },
 					h("label", { className: "dsp-toggle", title: sit.enabled ? "已启用" : "已停用" },
@@ -1024,24 +1224,89 @@ window.__ModuleLoader__.load({
 						onTest: onPreview,
 						onDelete: onDeleteSound
 					}),
-					h("button", { className: "dsp-btn", disabled: !sit.audioId, onClick: onTest }, "听"),
+					h("button", {
+						className: "dsp-btn" + (open ? " dsp-primary" : ""),
+						title: "展开这条情况的声音调整",
+						onClick: () => setOpen((v) => !v)
+					}, "设置"),
 					!sit.builtin ? h("button", { className: "dsp-btn dsp-danger", onClick: onRemove }, "删") : null
 				),
-				// 每条绑定自己的音量，互不影响；没有绑定音效时无意义，置灰。
-				h("div", { className: "dsp-vol-row" },
-					h("span", { className: "dsp-muted", style: { flex: "none" } }, "音量"),
-					h("input", {
-						className: "dsp-range",
-						type: "range",
-						min: 0,
-						max: 1,
-						step: 0.05,
-						value: vol,
-						disabled: !sit.audioId,
-						title: "这条情况单独的音量",
-						onChange: (e) => onVolume(Number(e.target.value))
-					}),
-					h("span", { className: "dsp-muted", style: { width: 36, textAlign: "right" } }, Math.round(vol * 100) + "%")
+				!open ? null : h("div", { className: "dsp-panel" },
+					// 音量
+					h("div", { className: "dsp-panel-row" },
+						h("span", { className: "dsp-panel-label" }, "音量"),
+						h("input", {
+							className: "dsp-range",
+							type: "range",
+							min: 0,
+							max: 1,
+							step: 0.05,
+							value: vol,
+							disabled: !sit.audioId,
+							title: "这条情况单独的音量",
+							onChange: (e) => onVolume(Number(e.target.value))
+						}),
+						h("span", { className: "dsp-muted", style: { width: 38, textAlign: "right" } }, Math.round(vol * 100) + "%")
+					),
+					// 播放区间：起点——终点，毫秒，默认全播放
+					h("div", { className: "dsp-panel-row" },
+						h("span", { className: "dsp-panel-label" }, "播放起点"),
+						h("input", {
+							className: "dsp-input dsp-num",
+							type: "number",
+							min: 0,
+							step: 1,
+							value: startText,
+							disabled: !sit.audioId,
+							title: "从第几毫秒开始播",
+							onChange: (e) => commitNumber("clipStart", e.target.value, 0)
+						}),
+						h("span", { className: "dsp-muted" }, "ms"),
+						h("span", { className: "dsp-muted", style: { margin: "0 2px" } }, "——"),
+						h("span", { className: "dsp-panel-label" }, "终点"),
+						h("input", {
+							className: "dsp-input dsp-num",
+							type: "number",
+							min: 0,
+							step: 1,
+							placeholder: duration ? String(duration) : "结尾",
+							value: endText,
+							disabled: !sit.audioId,
+							title: "播到第几毫秒（留空＝播到结尾）",
+							onChange: (e) => {
+								const raw = e.target.value;
+								if (raw === "") onChange({ clipEnd: null });
+								else commitNumber("clipEnd", raw, null);
+							}
+						}),
+						h("span", { className: "dsp-muted" }, "ms"),
+						h("button", {
+							className: "dsp-btn",
+							disabled: !sit.audioId,
+							title: "恢复为从头播到结尾",
+							onClick: () => onChange({ clipStart: 0, clipEnd: null })
+						}, "全播放"),
+						duration ? h("span", { className: "dsp-hint" }, "总长 " + duration + " ms") : null
+					),
+					// 特效 + 试听
+					h("div", { className: "dsp-panel-row" },
+						h("span", { className: "dsp-panel-label" }, "特效"),
+						h("select", {
+							className: "dsp-select",
+							value: sit.effect || "",
+							disabled: !sit.audioId,
+							onChange: (e) => onChange({ effect: e.target.value || null })
+						},
+							h("option", { value: "" }, "（无）"),
+							h("option", { value: "fade-out" }, "渐弱消失")
+						),
+						h("button", {
+							className: "dsp-btn" + (playing ? " dsp-stop" : " dsp-primary"),
+							disabled: !sit.audioId || busy,
+							title: playing ? "停止试听" : "按当前设置试听",
+							onClick: togglePreview
+						}, playing ? "■ 停止" : "试听")
+					)
 				)
 			);
 		}
@@ -1110,10 +1375,12 @@ window.__ModuleLoader__.load({
 							tree,
 							onChange: (patch) => board.setSituation(sit.id, patch),
 							onRemove: () => board.removeSituation(sit.id),
-							onTest: () => board.triggerSituation(sit.id),
 							onVolume: (v) => board.setSituationVolume(sit.id, v),
-							onPreview: (path) => board.previewSound(path),
-							onDeleteSound: (path) => board.deleteSound(path).then(() => setTree(board.getLibraryTree())).catch(() => { /* 忽略 */ })
+							// 悬停选择器里的音效时试听整条；面板的【试听】按该条的裁剪/音量/特效播。
+							onPreview: () => board.previewSituation(sit.id),
+							onStopPreview: () => board.stopPreview(),
+							onDeleteSound: (path) => board.deleteSound(path).then(() => setTree(board.getLibraryTree())).catch(() => { /* 忽略 */ }),
+							getSoundInfo: (path) => board.getSoundInfo(path)
 						}))
 					),
 					h("div", { className: "dsp-row", style: { marginTop: 8 } },

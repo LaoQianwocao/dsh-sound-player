@@ -30,11 +30,26 @@ let PLAYED = [];
 const take = () => { const p = PLAYED; PLAYED = []; return p; };
 const sig = (p) => p.map((x) => (x.kind === "file" ? "FILE" : x.f + "@" + x.t)).join(",");
 
-// Every gain write reaches the graph here: `value =` for file sounds, the attack
-// ramp for synth notes (release tails ramp to 0.0001 and are filtered out).
-let GAINS = [];
-const takeGains = () => { const g = GAINS; GAINS = []; return g; };
-const peaks = (g) => g.filter((v) => v > 0.0002);
+// Every gain write reaches the graph here, tagged with the node it belongs to:
+// the FIRST gain created in a window is the voice gain (carries the volume and
+// the fade ramp), later ones are per-note envelopes of a synth recipe.
+let GAIN_OPS = []; // { gid, op: 'value'|'set'|'ramp'|'lin', v }
+let GAIN_SEQ = 0;
+const takeGains = () => { const g = GAIN_OPS; GAIN_OPS = []; return g; };
+/** 本次窗口里最先建立的增益节点 = 声部增益。 */
+const voiceGid = (ops) => (ops.length ? Math.min(...ops.map((o) => o.gid)) : -1);
+/** 合成音效的音符包络峰值（排除声部增益）。 */
+const notePeaks = (ops) => {
+  const gid = voiceGid(ops);
+  return ops.filter((o) => o.op === "ramp" && o.gid !== gid).map((o) => o.v).filter((v) => v > 0.0002);
+};
+/** 声部增益上写入的音量值。 */
+const voiceLevels = (ops) => {
+  const gid = voiceGid(ops);
+  return ops.filter((o) => o.op === "value" && o.gid === gid).map((o) => o.v);
+};
+/** 声部增益上的渐弱斜坡终点（渐弱消失特效会留下 linearRamp）。 */
+const fadeRamps = (ops) => ops.filter((o) => o.op === "lin").map((o) => o.v);
 let KILLED = 0; // immediate-voice kills (engine replacing a still-playing sound)
 
 const SYNTH = {
@@ -55,31 +70,43 @@ const SIG2NAME = Object.fromEntries(Object.entries(SYNTH).map(([n, v]) => [v, n]
 
 class GainStub {
   constructor() {
+    this.gid = ++GAIN_SEQ;
+    const gid = this.gid;
     this.gain = {
       _v: 1,
       get value() { return this._v; },
-      set value(v) { this._v = v; GAINS.push(v); },
-      setValueAtTime() {},
-      exponentialRampToValueAtTime(v) { GAINS.push(v); },
+      set value(v) { this._v = v; GAIN_OPS.push({ gid, op: "value", v }); },
+      setValueAtTime(v) { GAIN_OPS.push({ gid, op: "set", v }); },
+      exponentialRampToValueAtTime(v) { GAIN_OPS.push({ gid, op: "ramp", v }); },
+      linearRampToValueAtTime(v) { GAIN_OPS.push({ gid, op: "lin", v }); },
     };
   }
   connect() {}
+  disconnect() {}
 }
 class OscStub {
   constructor() { this.type = "sine"; this.frequency = { value: 0 }; }
   connect() {}
-  start(t) { PLAYED.push({ kind: "synth", f: this.frequency.value, t }); }
-  // stop() 无参 = 立即掐断（引擎在换音/停声时调用）；带时间 = 配方自己排的收尾。
-  stop(t) { if (t === undefined) KILLED += 1; }
+  start(t) { PLAYED.push({ kind: "synth", f: this.frequency.value, t, stopT: null }); }
+  // stop() 无参 = 立即掐断（引擎换音/停声时调用）；带时间 = 配方自己排的收尾。
+  stop(t) {
+    if (t === undefined) { KILLED += 1; return; }
+    const rec = PLAYED[PLAYED.length - 1];
+    if (rec && rec.kind === "synth" && rec.stopT === null) rec.stopT = t;
+  }
 }
-class SrcStub { connect() {} start() { PLAYED.push({ kind: "file" }); } stop() {} }
+class SrcStub {
+  connect() {}
+  start(when, offset, duration) { PLAYED.push({ kind: "file", startArgs: [when, offset, duration] }); }
+  stop() { KILLED += 1; }
+}
 class AudioContextStub {
   constructor() { this.state = "running"; this.currentTime = 0; this.destination = {}; }
   resume() { this.state = "running"; return Promise.resolve(); }
   createGain() { return new GainStub(); }
   createOscillator() { return new OscStub(); }
   createBufferSource() { return new SrcStub(); }
-  decodeAudioData() { return Promise.resolve({}); }
+  decodeAudioData() { return Promise.resolve({ duration: 2.5 }); }
 }
 const req = (result) => {
   const r = { result, onsuccess: null, onerror: null, onupgradeneeded: null };
@@ -148,9 +175,21 @@ let hostHandler = null;
 
 // Minimal element tree instead of null, so the rendered settings page can be
 // asserted structurally (function components are invoked by renderNodes below).
+// FORCE_FALSE_COUNT forces that many false-initial useState calls per component:
+// 1 opens the 【设置】 panel (试听 处于未播放态)，2 再打开 playing 以渲染停止键。
+let FORCE_FALSE_COUNT = 0;
+let FORCE_LEFT = 0;
 const React = {
   createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
-  useState: (v) => [typeof v === "function" ? v() : v, () => {}],
+  useState: (v) => {
+    const initial = typeof v === "function" ? v() : v;
+    let value = initial;
+    if (FORCE_LEFT > 0 && initial === false) {
+      value = true;
+      FORCE_LEFT -= 1;
+    }
+    return [value, () => {}];
+  },
   useEffect: () => {},
   useRef: () => ({ current: null }),
 };
@@ -239,11 +278,21 @@ async function expect(label, wantSig) {
 const near = (a, b) => Math.abs(a - b) < 1e-6;
 async function expectGains(label, want) {
   await delay(30);
-  const got = peaks(takeGains());
+  const got = notePeaks(takeGains());
   const good = got.length === want.length && got.every((v, i) => near(v, want[i]));
   if (good) ok(label + " -> [" + got.join(", ") + "]");
   else fail(label + " -> [" + got.join(", ") + "] (want [" + want.join(", ") + "])");
 }
+/** 文件音效：音量写在声部增益上。 */
+async function expectVoiceLevel(label, want) {
+  await delay(30);
+  const got = voiceLevels(takeGains());
+  const good = got.length === want.length && got.every((v, i) => near(v, want[i]));
+  if (good) ok(label + " -> [" + got.join(", ") + "]");
+  else fail(label + " -> [" + got.join(", ") + "] (want [" + want.join(", ") + "])");
+}
+/** 音符序列（含各自时长，用于裁剪区间断言）。 */
+const sigDur = (p) => p.map((x) => (x.kind === "file" ? "FILE" : x.f + "@" + x.t + "/" + (x.stopT == null ? "?" : Math.round((x.stopT - x.t - 0.05) * 1000)))).join(",");
 
 function report() {
   console.warn = origWarn;
@@ -368,10 +417,68 @@ function report() {
   board.setSituationVolume("user-ask", 0.3);
   take(); takeGains();
   await fireSessionEvent("user/message", { source: { kind: "user" } });
-  await expectGains("file sound at its own volume 0.3", [0.3]);
+  await expectVoiceLevel("file sound at its own volume 0.3", [0.3]);
   board.setVolume(0.6); // legacy call must not reintroduce a global volume
   if (board.listSituations().every((s) => near(s.volume, 0.6))) ok("legacy setVolume(v) bulk-writes all situations");
   else fail("legacy setVolume(v) did not bulk-apply to every situation");
+
+  // 6c) 播放区间（起点/终点）与「渐弱消失」特效
+  board.setSituationVolume("conversation-complete", 0.8);
+  board.setSituation("conversation-complete", { clipStart: 100, clipEnd: null, effect: null });
+  take(); takeGains();
+  await board.triggerSituation("conversation-complete");
+  await delay(30);
+  const clipped = take();
+  // 起点 100ms：第一个音符(0..200)被切到 100..200 -> 0ms 起、100ms 长；
+  // 第二(100..300)/第三(200..400)/第四(300..700) 依次平移。
+  const wantClip = "523.25@0/100,659.25@0/200,783.99@0.1/200,1046.5@0.2/400";
+  if (sigDur(clipped) === wantClip) ok("clip start 100ms -> " + sigDur(clipped));
+  else fail("clip start -> " + sigDur(clipped) + " (want " + wantClip + ")");
+
+  board.setSituation("conversation-complete", { clipStart: 0, clipEnd: 500, effect: null });
+  take(); takeGains();
+  await board.triggerSituation("conversation-complete");
+  await delay(30);
+  const cut = take();
+  // 终点 500ms：最后一个音符(300..700)被截到 300..500 -> 200ms 长
+  const wantCut = "523.25@0/200,659.25@0.1/200,783.99@0.2/200,1046.5@0.3/200";
+  if (sigDur(cut) === wantCut) ok("clip end 500ms -> " + sigDur(cut));
+  else fail("clip end -> " + sigDur(cut) + " (want " + wantCut + ")");
+
+  board.setSituation("conversation-complete", { clipStart: 0, clipEnd: null, effect: "fade-out" });
+  take(); takeGains();
+  await board.triggerSituation("conversation-complete");
+  await delay(30);
+  const fadeRamp = fadeRamps(takeGains());
+  if (fadeRamp.length && near(fadeRamp[0], 0.0001)) ok("effect fade-out schedules a gain ramp to 0");
+  else fail("fade-out did not schedule a ramp: [" + fadeRamp.join(", ") + "]");
+
+  // 文件音效的区间：起点作为 offset、终点决定 duration
+  board.setSituation("user-ask", { clipStart: 200, clipEnd: 1200, effect: null });
+  take(); takeGains();
+  await fireSessionEvent("user/message", { source: { kind: "user" } });
+  await delay(30);
+  const fileRec = take().find((x) => x.kind === "file");
+  const args = fileRec ? fileRec.startArgs : [];
+  if (args.length === 3 && near(args[1], 0.2) && near(args[2], 1)) ok("file clip -> offset " + args[1] + "s, duration " + args[2] + "s");
+  else fail("file clip args = " + JSON.stringify(args) + " (want offset 0.2s / duration 1s)");
+
+  // 6d) 试听可被停止（防止导入整首歌被迫放完）
+  board.setSituation("conversation-complete", { clipStart: 0, clipEnd: null, effect: null });
+  take(); KILLED = 0;
+  const voice = await board.previewSituation("conversation-complete");
+  await delay(20);
+  if (voice && typeof voice.stop === "function") ok("previewSituation returns a stoppable voice");
+  else fail("previewSituation did not return a voice");
+  let ended = false;
+  if (voice) voice.ended.then(() => { ended = true; });
+  const stopped = board.stopPreview();
+  await delay(20);
+  if (stopped && KILLED >= 4) ok("stopPreview stops the sounding voice (killed " + KILLED + ")");
+  else fail("stopPreview did not stop playback (killed=" + KILLED + ")");
+  await delay(20);
+  if (ended) ok("stopped voice resolves its ended promise (试听按键可复位)");
+  else fail("ended promise not resolved after stop");
 
   // 7) subagents are no longer scoped to the current session tree
   listState.byId = {
@@ -455,7 +562,12 @@ function report() {
     if (node == null || node === false || node === true) return out;
     if (Array.isArray(node)) { for (const n of node) renderNodes(n, out); return out; }
     if (typeof node !== "object") return out;
-    if (typeof node.type === "function") return renderNodes(node.type(node.props), out);
+    if (typeof node.type === "function") {
+      FORCE_LEFT = FORCE_FALSE_COUNT;
+      const el = node.type(node.props);
+      FORCE_LEFT = 0;
+      return renderNodes(el, out);
+    }
     out.push(node);
     for (const c of node.children || []) renderNodes(c, out);
     return out;
@@ -465,7 +577,12 @@ function report() {
     if (typeof node === "string" || typeof node === "number") { out.push(String(node)); return out; }
     if (Array.isArray(node)) { for (const n of node) renderTexts(n, out); return out; }
     if (typeof node !== "object") return out;
-    if (typeof node.type === "function") return renderTexts(node.type(node.props), out);
+    if (typeof node.type === "function") {
+      FORCE_LEFT = FORCE_FALSE_COUNT;
+      const el = node.type(node.props);
+      FORCE_LEFT = 0;
+      return renderTexts(el, out);
+    }
     for (const c of node.children || []) renderTexts(c, out);
     return out;
   }
@@ -476,9 +593,8 @@ function report() {
     const texts = renderTexts(uiTree, []);
     const count = board.listSituations().length;
     const sliders = nodes.filter((n) => n.type === "input" && n.props.type === "range");
-    const perItem = sliders.filter((n) => typeof n.props.title === "string" && n.props.title.indexOf("这条情况") >= 0);
-    if (sliders.length === count && perItem.length === count) ok("UI: " + count + " per-item volume sliders and no global slider");
-    else fail("UI: " + sliders.length + " sliders / " + perItem.length + " per-item (expect " + count + ")");
+    if (sliders.length === 0) ok("UI: 调整项默认收起（行上不再常驻音量滑块）");
+    else fail("UI: " + sliders.length + " sliders visible while panels are collapsed");
     if (texts.includes("总开关") && !texts.some((t) => t.indexOf("总开关与音量") >= 0)) ok("UI: global volume row removed from the switch section");
     else fail("UI: switch section title still mentions volume");
 
@@ -487,23 +603,60 @@ function report() {
     if (pickers.length === count) ok("UI: " + count + " cascading sound pickers");
     else fail("UI: " + pickers.length + " pickers (expect " + count + ")");
     const pickerBtns = nodes.filter((n) => typeof n.props.className === "string" && n.props.className.indexOf("dsp-picker-btn") >= 0);
-    if (pickerBtns.length === count) ok("UI: picker buttons rendered per binding");
-    else fail("UI: " + pickerBtns.length + " picker buttons (expect " + count + ")");
-    const firstLabel = pickerBtns.length ? renderTexts(pickerBtns[0].children ? { type: "div", props: {}, children: pickerBtns[0].children } : null, []) : [];
+    const firstLabel = pickerBtns.length ? renderTexts({ type: "div", props: {}, children: pickerBtns[0].children || [] }, []) : [];
     if (firstLabel.join("").indexOf("完成音（上扬）") >= 0) ok("UI: picker button shows the bound sound short name");
     else fail("UI: picker button label = " + JSON.stringify(firstLabel.join("")));
+
+    // 行上应有【设置】按钮
+    const btnTexts = nodes
+      .filter((n) => n.type === "button")
+      .map((n) => renderTexts({ type: "div", props: {}, children: n.children || [] }, []).join(""));
+    const settingsBtns = btnTexts.filter((t) => t.indexOf("设置") >= 0).length;
+    if (settingsBtns === count) ok("UI: " + count + " 【设置】buttons");
+    else fail("UI: " + settingsBtns + " 【设置】buttons (expect " + count + ")");
 
     // 音效库导入区不再列出音效，改为三个按钮
     const sndRows = nodes.filter((n) => typeof n.props.className === "string" && n.props.className.indexOf("dsp-snd-row") >= 0);
     if (sndRows.length === 0) ok("UI: import section no longer lists sounds");
     else fail("UI: import section still renders " + sndRows.length + " sound rows");
-    const btnTexts = nodes
-      .filter((n) => n.type === "button")
-      .map((n) => renderTexts({ type: "div", props: {}, children: n.children || [] }, []).join(""));
     for (const want of ["导入音效", "导入文件夹", "打开音效库"]) {
       if (btnTexts.some((t) => t.indexOf(want) >= 0)) ok("UI: import section has 「" + want + "」");
       else fail("UI: import section missing 「" + want + "」");
     }
+
+    // 展开【设置】后的面板：音量 / 起点 / 终点 / 特效 / 试听
+    // （必须在渲染期间保持 FORCE_FALSE_COUNT：createElement 是惰性的，
+    //   renderNodes 才真正调用组件。）
+    FORCE_FALSE_COUNT = 1;
+    const openTree = React.createElement(REGISTERED[0].component, { board });
+    const openNodes = renderNodes(openTree, []);
+    const openTexts = renderTexts(openTree, []);
+    FORCE_FALSE_COUNT = 0;
+    const panels = openNodes.filter((n) => n.props.className === "dsp-panel");
+    if (panels.length === count) ok("UI: 【设置】展开出 " + count + " 个调整面板");
+    else fail("UI: " + panels.length + " panels (expect " + count + ")");
+    const openRanges = openNodes.filter((n) => n.type === "input" && n.props.type === "range");
+    if (openRanges.length === count) ok("UI: 面板里有 " + count + " 个音量滑块");
+    else fail("UI: " + openRanges.length + " volume sliders in panels (expect " + count + ")");
+    const numInputs = openNodes.filter((n) => n.type === "input" && n.props.type === "number");
+    if (numInputs.length === count * 2) ok("UI: 每条绑定两个毫秒输入（起点 / 终点）");
+    else fail("UI: " + numInputs.length + " number inputs (expect " + count * 2 + ")");
+    if (numInputs.length && numInputs[0].props.step === 1) ok("UI: 时间输入精确到 1 毫秒");
+    else fail("UI: 时间输入 step = " + (numInputs[0] && numInputs[0].props.step));
+    for (const want of ["播放起点", "特效", "渐弱消失", "试听"]) {
+      if (openTexts.some((t) => t.indexOf(want) >= 0)) ok("UI: 面板含「" + want + "」");
+      else fail("UI: 面板缺少「" + want + "」");
+    }
+
+    // 播放中：试听按钮变成红色方形停止键（状态位由 FORCE_FALSE_COUNT=2 打开）
+    FORCE_FALSE_COUNT = 2;
+    const playingTree = React.createElement(REGISTERED[0].component, { board });
+    const playingNodes = renderNodes(playingTree, []);
+    FORCE_FALSE_COUNT = 0;
+    const stopBtns = playingNodes.filter((n) => n.type === "button" && typeof n.props.className === "string" && n.props.className.indexOf("dsp-stop") >= 0);
+    const stopLabels = stopBtns.map((n) => renderTexts({ type: "div", props: {}, children: n.children || [] }, []).join(""));
+    if (stopBtns.length === count && stopLabels.every((t) => t.indexOf("■") >= 0)) ok("UI: 播放中显示 " + count + " 个红色方形停止键（■ 停止）");
+    else fail("UI: 停止键 " + stopBtns.length + " 个，标签 " + JSON.stringify(stopLabels.slice(0, 2)));
   }
 
   report();

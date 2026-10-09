@@ -16,7 +16,11 @@
    - 为每种「情况」绑定音效并开关，显示格式如 `【√】发送消息时播放【提示音1】`；
    - **级联式音效选择器**：下拉里是三个音效库，鼠标悬停文件夹即在右侧展开内容，
      子文件夹继续向右展开（支持任意层级）；
-   - **每条绑定下方各有自己的音量滑块**，互不影响——对话完成可以响亮、子代理完成可以很轻；
+   - **每条绑定都有一个【设置】面板**（点开后在行下方展开）：音量滑块、
+     播放区间「起点 —— 终点」（毫秒，精确到 ms，默认全播放；导入的长音频可以只播其中一小段）、
+     特效（目前提供「渐弱消失」）、以及【试听】；
+   - **【试听】在播放中会变成红色方形停止键**，再点一下即中止——导入整首歌也不会被迫放完；
+     试听按该条绑定的音量 / 区间 / 特效播放，但不受总开关与单条开关影响；
    - 导入音频：导入音效 / 导入文件夹（写入「自定义音效库」，文件夹导入保留子目录结构），
      也可把音频拖到设置页；
    - **打开音效库**：在文件管理器里打开库目录，可直接改名、加子文件夹、删文件。
@@ -42,6 +46,7 @@
 4. **供其他插件使用的 API**（`ctx.get("soundPlayer")` 或 `window.__dshSoundPlayer__`）
    - 导入音频：`importAudioFile(file)` / `importAudioFiles(files)` / `importAudioDir(files)`（一律写入自定义音效库）
    - 音效库：`getLibraryTree()` / `refreshLibrary()` / `openLibrary(path?)` / `listSounds()` / `listSoundsMeta()` / `previewSound(path)` / `deleteSound(path)`（仅自定义库）
+   - 试听（带该条的音量 / 区间 / 特效）：`previewSituation(id)` → 返回可 `stop()` 的声部句柄 / `stopPreview()` / `getSoundInfo(path)`（取时长，毫秒）
    - 增添情况：`addSituation({ label, trigger, audioId?, enabled?, volume? })` → 返回 id
    - 触发情况并播放音效：`triggerSituation(id)` / `trigger(id)`
    - 修改情况：`setSituation(id, patch)`、`setSituationEnabled(id, b)`、`setSituationAudio(id, audioId)`、`setSituationVolume(id, v)`、`removeSituation(id)`
@@ -155,6 +160,10 @@ dsh plugin add ./dsh-sound-player-0.2.0.tgz
   导入音效会在首次启动时搬到「自定义音效库」，只做一次。
 - 音量是**逐条绑定**的属性；播放时只读这条绑定自身的音量，没有任何全局音量参与。
   配置从 v2 升到 v3 时会自动把老的全局音量写进每条情况作为初值（升级后响度不变）。
+- 每条绑定另有「播放区间」与「特效」：`clipStart` / `clipEnd`（毫秒，`clipEnd` 为空
+  表示播到结尾）、`effect`（`"fade-out"`＝渐弱消失）。音频文件按 `start(offset, duration)`
+  截取；合成音效会把落在区间外的音符去掉、跨界音符按区间截断。配置 v5 → v6 会给老配置
+  补上默认值（起点 0、终点空、无特效），升级后播放范围不变。
 - 「服务终止」在连接代际消失（`generation` → `undefined`）或连接状态进入
   `disconnected` 时播放一次，带 5 秒防抖，避免重连抖动重复响。
 - 「子代理运行完成」通过 `sessions.list` 快照中 `origin === "subagent"` 行的
