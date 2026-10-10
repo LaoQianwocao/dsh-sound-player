@@ -169,9 +169,18 @@ console.warn = (...a) => { warns.push(a.join(" ")); };
 
 vm.runInThisContext(code, { filename: target });
 
-// —— 先把宿主端接上：捕获它注册的 soundPlayer/* handler ——
+// —— 先把宿主端接上：捕获它注册的两种 handler ——
 const hostModPromise = import(pathToFileURL(path.join(__dirname, "..", "lib", "index.js")).href);
-let hostHandler = null;
+let hostHandleHandler = null;   // rpc.handle("soundPlayer", …) 注册的（endpoint 不带前缀）
+let hostInterceptHandler = null; // rpc.intercept("/api", …) 注册的（endpoint 带前缀）
+let hostHandleChannel = null;
+let lastRpcChannel = null;      // 客户端最后一次实际使用的通道
+let hostHandler = (endpoint, payload) => {
+  // 兼容旧断言用的直接调用：优先专用通道，退回拦截通道。
+  if (hostHandleHandler) return hostHandleHandler(endpoint.replace(/^soundPlayer\//, ""), payload);
+  if (hostInterceptHandler) return hostInterceptHandler(endpoint, payload);
+  return Promise.resolve({ ok: false, error: { code: "x", message: "no host handler", details: {} } });
+};
 
 // Minimal element tree instead of null, so the rendered settings page can be
 // asserted structurally (function components are invoked by renderNodes below).
@@ -227,12 +236,17 @@ const sessions = {
 const connection = {
   generation: { getSnapshot: () => gen, subscribe: (cb) => { genListener = cb; return () => {}; } },
   state: { getSnapshot: () => connState, subscribe: (cb) => { stateListener = cb; return () => {}; } },
-  // 音效库走真实的宿主端点：把 hostHandler 当作 RPC 传输层接上，
+  // 音效库走真实的宿主端点：按通道分发到宿主注册的两种 handler 之一，
   // 这样客户端测试读的是 sounds/ 里真实的文件。
   rpc: {
     call: async (channel, endpoint, payload) => {
-      if (!hostHandler) throw new Error("host handler 未注册");
-      return hostHandler(endpoint, payload);
+      lastRpcChannel = channel;
+      if (channel === "soundPlayer") {
+        if (!hostHandleHandler) throw new Error("专用通道未注册");
+        return hostHandleHandler(endpoint, payload);
+      }
+      if (!hostInterceptHandler) throw new Error("共享通道未注册");
+      return hostInterceptHandler(endpoint, payload);
     },
   },
 };
@@ -304,19 +318,27 @@ function report() {
 }
 
 (async () => {
-  // 先把宿主端挂上并捕获它的 soundPlayer/* handler，再 apply 客户端。
+  // 先把宿主端挂上并捕获它的两种注册，再 apply 客户端。
   const hostMod = await hostModPromise;
   hostMod.apply({
     get: (k) => (k === "connection" ? {
-      rpc: { intercept: (channel, matches, h) => { hostHandler = h; return async () => { hostHandler = null; }; } },
+      rpc: {
+        // 专用通道：endpoint 不带前缀（tree / read / …）
+        handle: (channel, h) => { hostHandleChannel = channel; hostHandleHandler = h; return async () => {}; },
+        // 共享通道拦截：endpoint 形如 soundPlayer/tree
+        intercept: (channel, matches, h) => { hostInterceptHandler = h; return async () => {}; },
+      },
     } : undefined),
     on: () => {},
   });
-  if (typeof hostHandler !== "function") { fail("宿主端 handler 未注册"); report(); return; }
-  ok("宿主端 soundPlayer/* handler 已接到客户端 RPC 传输层");
+  if (typeof hostHandleHandler === "function" && typeof hostInterceptHandler === "function") {
+    ok("宿主端同时注册专用通道与 /api 拦截（channel=" + hostHandleChannel + "）");
+  } else fail("宿主端注册不完整: handle=" + typeof hostHandleHandler + " intercept=" + typeof hostInterceptHandler);
 
   mod.apply(ctx);
   await delay(60); // 等 refreshLibrary() 完成
+  if (lastRpcChannel === "soundPlayer") ok("客户端优先走专用通道 soundPlayer");
+  else fail("客户端首选通道 = " + lastRpcChannel);
 
   // 0) no session yet -> must not attach
   callList();
@@ -658,6 +680,20 @@ function report() {
     if (stopBtns.length === count && stopLabels.every((t) => t.indexOf("■") >= 0)) ok("UI: 播放中显示 " + count + " 个红色方形停止键（■ 停止）");
     else fail("UI: 停止键 " + stopBtns.length + " 个，标签 " + JSON.stringify(stopLabels.slice(0, 2)));
   }
+
+  // 12) 专用通道不可用时，退回 /api 拦截通道（宿主只注册了一种的情况）
+  const savedHandle = hostHandleHandler;
+  const mod2 = factory((n) => { if (n === "react") return React; throw new Error("unexpected require: " + n); });
+  hostHandleHandler = null;
+  lastRpcChannel = null;
+  mod2.apply(ctx);
+  await delay(60);
+  const tree2 = globalThis.window.__dshSoundPlayer__.getLibraryTree();
+  if (tree2 && tree2.children.length === 3) ok("专用通道不可用时退回 /api 拦截通道");
+  else fail("回退后仍读不到库: " + (tree2 ? tree2.children.length : "null"));
+  if (lastRpcChannel === "/api") ok("回退确实走了共享通道 /api（lastRpcChannel=" + lastRpcChannel + "）");
+  else fail("回退通道 = " + lastRpcChannel);
+  hostHandleHandler = savedHandle;
 
   report();
 })();

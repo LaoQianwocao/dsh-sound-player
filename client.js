@@ -165,14 +165,23 @@ window.__ModuleLoader__.load({
 		let clientConnection = null;
 		let libraryTree = null; // { root, children }，来自宿主端
 		let libraryError = null;
+		let libraryStatus = null; // 宿主端状态端点回报的 { recorded, libRoot, counts }
 		/** 已解析的音效缓存：path -> { kind, recipe | buffer }。 */
 		const soundCache = new Map();
 
-		/** 调用宿主端音效库端点。失败抛出带可读消息的 Error。 */
-		function rpc(endpoint, payload) {
+		// 宿主端有两种注册方式，对应两种调用方式：先用专用通道 soundPlayer，
+		// 失败再退回共享通道（宿主的 intercept 注册）。哪条先成功就记住它。
+		const RPC_ROUTES = [
+			{ channel: "soundPlayer", endpoint: (name) => name },
+			{ channel: RPC_CHANNEL, endpoint: (name) => RPC_PREFIX + name }
+		];
+		let rpcRouteIndex = 0;
+		let lastRpcError = null;
+
+		function callRoute(route, name, payload) {
 			const face = clientConnection && clientConnection.rpc ? clientConnection.rpc : null;
 			if (!face || typeof face.call !== "function") return Promise.reject(new Error("宿主端连接不可用"));
-			return face.call(RPC_CHANNEL, RPC_PREFIX + endpoint, payload || {}, undefined).then((result) => {
+			return face.call(route.channel, route.endpoint(name), payload || {}, undefined).then((result) => {
 				if (!result || result.ok !== true) {
 					const message = result && result.error && result.error.message ? result.error.message : "音效库调用失败";
 					throw new Error(message);
@@ -180,13 +189,46 @@ window.__ModuleLoader__.load({
 				return result.value;
 			});
 		}
+		/**
+		 * 调用宿主端音效库端点。失败抛出带可读消息的 Error。
+		 * @param {string} name - 端点短名：tree / read / import / delete / open / status。
+		 * @param {object} [payload] - 载荷。
+		 */
+		function rpc(name, payload) {
+			const first = Math.min(rpcRouteIndex, RPC_ROUTES.length - 1);
+			return callRoute(RPC_ROUTES[first], name, payload).catch((err) => {
+				const others = RPC_ROUTES
+					.map((route, index) => ({ route, index }))
+					.filter((item) => item.index !== first);
+				if (!others.length) { lastRpcError = err; throw err; }
+				const next = others[0];
+				return callRoute(next.route, name, payload).then((value) => {
+					rpcRouteIndex = next.index; // 记住能用的那条
+					lastRpcError = null;
+					return value;
+				}).catch((err2) => {
+					lastRpcError = err2;
+					throw err2;
+				});
+			});
+		}
 		function libraryLoaded() {
 			return !!(libraryTree && Array.isArray(libraryTree.children));
+		}
+		/** 每个顶层库里的音效数量（界面只显示数量，不显示路径）。 */
+		function libraryCounts() {
+			const out = {};
+			for (const lib of (libraryTree && libraryTree.children) || []) {
+				out[lib.name] = lib.type === "dir" ? flattenLibrary(lib.children).size : 0;
+			}
+			return out;
 		}
 		async function refreshLibrary() {
 			try {
 				libraryTree = await rpc("tree");
 				libraryError = null;
+				// 顺带取一次宿主端自报状态：库根目录在哪、端点注册成没成。
+				try { libraryStatus = await rpc("status"); } catch (err) { libraryStatus = null; }
 			} catch (err) {
 				libraryError = err;
 			}
@@ -960,7 +1002,10 @@ window.__ModuleLoader__.load({
 					situations: deepClone(config.situations),
 					library: {
 						loaded: libraryLoaded(),
-						error: libraryError ? String(libraryError.message || libraryError) : null
+						error: libraryError ? String(libraryError.message || libraryError) : null,
+						counts: libraryCounts(),
+						// 库根目录只用于 tooltip，不铺在界面上占位。
+						root: libraryStatus && libraryStatus.libRoot ? String(libraryStatus.libRoot) : ""
 					}
 				};
 			},
@@ -990,6 +1035,9 @@ window.__ModuleLoader__.load({
 .dsp-sit-block { padding: 6px 0; border-bottom: 1px dashed var(--dsw-alias-border-l2, rgba(255,255,255,.07)); }
 .dsp-sit-block:last-child { border-bottom: none; }
 .dsp-sit-row { display: flex; align-items: center; gap: 8px; }
+/* 固定列宽，让每行的名称 / 音效选择 / 按钮纵向对齐；长名字截断并放进 title。 */
+.dsp-sit-label { flex: none; width: 208px; min-width: 208px; overflow: hidden; }
+.dsp-sit-label .dsp-sit-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dsp-vol-row { display: flex; align-items: center; gap: 8px; padding: 3px 0 0 42px; }
 .dsp-vol-row .dsp-range { max-width: 220px; }
 /* —— 【设置】展开的调整面板 —— */
@@ -1022,7 +1070,7 @@ window.__ModuleLoader__.load({
 .dsp-divider { height: 1px; background: var(--dsw-alias-border-l2, rgba(255,255,255,.08)); margin: 4px 0; }
 /* —— 级联音效选择器 —— */
 .dsp-picker { position: relative; flex: none; }
-.dsp-picker-btn { min-width: 132px; max-width: 176px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.dsp-picker-btn { width: 170px; min-width: 170px; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
 .dsp-picker-btn .dsp-caret { opacity: .6; margin-left: 4px; }
 .dsp-menu { position: fixed; z-index: 60; min-width: 172px; max-height: 340px; overflow-y: auto; padding: 4px; border: 1px solid var(--dsw-alias-border-l2, rgba(255,255,255,.14)); border-radius: 10px; background: var(--dsw-alias-bg-layer-3, #1f2430); box-shadow: 0 8px 26px rgba(0,0,0,.38); }
 .dsp-menu-item { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 7px; cursor: pointer; font-size: 12px; color: var(--dsw-alias-label-primary, #e5e7eb); white-space: nowrap; }
@@ -1129,7 +1177,6 @@ window.__ModuleLoader__.load({
 			};
 
 			const label = value ? shortName(value) : "（无）";
-			const parentHint = value && value.indexOf("/") >= 0 ? value.split("/").slice(0, -1).join("/") : "";
 			return h("div", { className: "dsp-picker", ref: wrapRef },
 				h("button", {
 					className: "dsp-btn dsp-picker-btn",
@@ -1148,8 +1195,7 @@ window.__ModuleLoader__.load({
 					style: { left: level.left, top: level.top }
 				},
 					level.nodes.length ? level.nodes.map((n) => renderRow(index + 1, n)) : h("div", { className: "dsp-menu-empty" }, "（空文件夹）")
-				)),
-				parentHint ? h("span", { className: "dsp-hint", style: { marginLeft: 6 } }, parentHint) : null
+				))
 			);
 		}
 
@@ -1214,7 +1260,7 @@ window.__ModuleLoader__.load({
 						h("span", { className: "dsp-knob" })
 					),
 					h("div", { className: "dsp-sit-label" },
-						h("span", { className: "dsp-sit-name" }, (sit.enabled ? "【√】" : "【 】") + sit.label + (sit.builtin ? "" : "（自定义）")),
+						h("span", { className: "dsp-sit-name", title: sit.label }, (sit.enabled ? "【√】" : "【 】") + sit.label + (sit.builtin ? "" : "（自定义）")),
 						h("span", { className: "dsp-sit-trigger" }, "触发：" + (TRIGGER_LABELS[sit.trigger] || sit.trigger))
 					),
 					h(SoundPicker, {
@@ -1458,9 +1504,21 @@ window.__ModuleLoader__.load({
 						}
 					}, "把音频文件拖到这里，或点击选择"),
 					state.library && state.library.error
-						? h("div", { className: "dsp-hint", style: { color: "var(--dsw-alias-state-error-primary, #fca5a5)" } }, "音效库不可用：" + state.library.error)
+						? h("div", { className: "dsp-row", style: { alignItems: "flex-start" } },
+							h("span", { className: "dsp-hint", style: { flex: 1, color: "var(--dsw-alias-state-error-primary, #fca5a5)" } },
+								"音效库不可用：" + state.library.error + "（宿主半段改动需要重启桌面端才会生效）"),
+							h("button", {
+								className: "dsp-btn",
+								title: "重新向宿主端请求音效库",
+								onClick: () => board.refreshLibrary()
+							}, "重试")
+						)
 						: h("div", { className: "dsp-hint" },
-							"音效不在此处列出——在每条绑定的下拉菜单里按文件夹浏览（默认音效库 / 神人音效库 / 自定义音效库）。导入的文件会落到自定义音效库，可用「打开音效库」直接编辑或往里加子文件夹。"
+							"音效库：" + Object.keys(state.library && state.library.counts ? state.library.counts : {})
+								.map((name) => name + " " + state.library.counts[name])
+								.join(" · ")
+							+ "。音效不在此处列出——在每条绑定的下拉菜单里按文件夹浏览；"
+							+ "导入的文件会落到自定义音效库，可用「打开音效库」直接编辑或往里加子文件夹。"
 						)
 				),
 				h("div", { className: "dsp-sec" },
