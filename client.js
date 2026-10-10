@@ -169,47 +169,30 @@ window.__ModuleLoader__.load({
 		/** 已解析的音效缓存：path -> { kind, recipe | buffer }。 */
 		const soundCache = new Map();
 
-		// 宿主端有两种注册方式，对应两种调用方式：先用专用通道 soundPlayer，
-		// 失败再退回共享通道（宿主的 intercept 注册）。哪条先成功就记住它。
-		const RPC_ROUTES = [
-			{ channel: "soundPlayer", endpoint: (name) => name },
-			{ channel: RPC_CHANNEL, endpoint: (name) => RPC_PREFIX + name }
-		];
-		let rpcRouteIndex = 0;
+		// 客户端 RPC 的真实形态：把 channel/endpoint 拼成 HTTP 路径 POST
+		// （`api/soundPlayer/tree`），而 web 端只挂载了 `/api` —— 所以只能走这一条，
+		// endpoint 必须带 soundPlayer/ 前缀（宿主按前缀拦截）。
 		let lastRpcError = null;
 
-		function callRoute(route, name, payload) {
-			const face = clientConnection && clientConnection.rpc ? clientConnection.rpc : null;
-			if (!face || typeof face.call !== "function") return Promise.reject(new Error("宿主端连接不可用"));
-			return face.call(route.channel, route.endpoint(name), payload || {}, undefined).then((result) => {
-				if (!result || result.ok !== true) {
-					const message = result && result.error && result.error.message ? result.error.message : "音效库调用失败";
-					throw new Error(message);
-				}
-				return result.value;
-			});
-		}
 		/**
 		 * 调用宿主端音效库端点。失败抛出带可读消息的 Error。
 		 * @param {string} name - 端点短名：tree / read / import / delete / open / status。
 		 * @param {object} [payload] - 载荷。
 		 */
 		function rpc(name, payload) {
-			const first = Math.min(rpcRouteIndex, RPC_ROUTES.length - 1);
-			return callRoute(RPC_ROUTES[first], name, payload).catch((err) => {
-				const others = RPC_ROUTES
-					.map((route, index) => ({ route, index }))
-					.filter((item) => item.index !== first);
-				if (!others.length) { lastRpcError = err; throw err; }
-				const next = others[0];
-				return callRoute(next.route, name, payload).then((value) => {
-					rpcRouteIndex = next.index; // 记住能用的那条
-					lastRpcError = null;
-					return value;
-				}).catch((err2) => {
-					lastRpcError = err2;
-					throw err2;
-				});
+			const face = clientConnection && clientConnection.rpc ? clientConnection.rpc : null;
+			if (!face || typeof face.call !== "function") {
+				lastRpcError = new Error("宿主端连接不可用");
+				return Promise.reject(lastRpcError);
+			}
+			return face.call(RPC_CHANNEL, RPC_PREFIX + name, payload || {}, undefined).then((result) => {
+				if (!result || result.ok !== true) {
+					const message = result && result.error && result.error.message ? result.error.message : "音效库调用失败";
+					lastRpcError = new Error(message);
+					throw lastRpcError;
+				}
+				lastRpcError = null;
+				return result.value;
 			});
 		}
 		function libraryLoaded() {

@@ -54,11 +54,12 @@ function countType(nodes, type) {
 	};
 
 	mod.apply(ctx);
-	if (typeof handleHandler === "function" && typeof interceptHandler === "function") {
-		ok("两种注册都建立：专用通道 " + handleChannel + " + /api 拦截");
-	} else fail("注册不完整: handle=" + typeof handleHandler + " intercept=" + typeof interceptHandler);
-	if (Array.isArray(mod.inject) && mod.inject.length === 0) ok("宿主端不硬依赖任何服务（缺少 connection 时静默降级）");
-	else fail("inject 应为空数组，实际: " + JSON.stringify(mod.inject));
+	if (typeof interceptHandler === "function") ok("在 /api 共享通道上注册了拦截（浏览器唯一可达的通道）");
+	else fail("未注册 /api 拦截");
+	if (typeof handleHandler === "function") ok("同时注册了宿主侧专用通道 " + handleChannel);
+	else fail("未注册专用通道");
+	if (Array.isArray(mod.inject) && mod.inject.includes("connection")) ok("inject 声明了 connection 依赖（避免早于服务就绪而拿不到 rpc）");
+	else fail("inject 应包含 connection，实际: " + JSON.stringify(mod.inject));
 
 	// 专用通道用不带前缀的 endpoint；共享通道用带前缀的 endpoint（内部剥掉前缀）。
 	const handler = (name, payload) => handleHandler(name, payload);
@@ -142,8 +143,8 @@ function countType(nodes, type) {
 		const p = path.join(customDir, f);
 		if (fs.existsSync(p)) fs.unlinkSync(p);
 	}
-	// 状态文件是宿主运行时产物：测试用完删掉，避免与真实 app 的写入混淆。
-	if (fs.existsSync(markerFile)) fs.unlinkSync(markerFile);
+	// 状态文件是宿主运行时产物，等下面的断言读完之后再删（避免与真实 app 的写入混淆）。
+	const statusFile = path.join(libRoot, ".host-status.json");
 	const left = fs.existsSync(customDir) ? fs.readdirSync(customDir).filter((f) => !f.startsWith(".")) : [];
 	if (left.length === 0) ok("测试产物已清理，自定义音效库为空");
 	else fail("自定义音效库残留: " + left.join(", "));
@@ -177,6 +178,9 @@ function countType(nodes, type) {
 	for (const d of disposers.slice()) { try { await d(); } catch (e) { /* 忽略 */ } }
 	if (disposers.length >= before && disposers.includes("handle") && disposers.includes("intercept")) ok("dispose 会释放两种端点注册");
 	else fail("dispose 未释放端点: " + JSON.stringify(disposers));
+
+	// 最后清掉运行时状态文件：让「重启后是否出现」成为宿主加载新代码的判据。
+	if (fs.existsSync(statusFile)) fs.unlinkSync(statusFile);
 
 	report();
 })();

@@ -175,6 +175,8 @@ let hostHandleHandler = null;   // rpc.handle("soundPlayer", …) 注册的（en
 let hostInterceptHandler = null; // rpc.intercept("/api", …) 注册的（endpoint 带前缀）
 let hostHandleChannel = null;
 let lastRpcChannel = null;      // 客户端最后一次实际使用的通道
+let lastRpcEndpoint = null;     // 以及端点（应为 soundPlayer/<name>）
+const rpcEndpoints = [];        // 本次跑过的所有端点
 let hostHandler = (endpoint, payload) => {
   // 兼容旧断言用的直接调用：优先专用通道，退回拦截通道。
   if (hostHandleHandler) return hostHandleHandler(endpoint.replace(/^soundPlayer\//, ""), payload);
@@ -241,6 +243,8 @@ const connection = {
   rpc: {
     call: async (channel, endpoint, payload) => {
       lastRpcChannel = channel;
+      lastRpcEndpoint = endpoint;
+      rpcEndpoints.push(endpoint);
       if (channel === "soundPlayer") {
         if (!hostHandleHandler) throw new Error("专用通道未注册");
         return hostHandleHandler(endpoint, payload);
@@ -331,14 +335,14 @@ function report() {
     } : undefined),
     on: () => {},
   });
-  if (typeof hostHandleHandler === "function" && typeof hostInterceptHandler === "function") {
-    ok("宿主端同时注册专用通道与 /api 拦截（channel=" + hostHandleChannel + "）");
-  } else fail("宿主端注册不完整: handle=" + typeof hostHandleHandler + " intercept=" + typeof hostInterceptHandler);
+  if (typeof hostInterceptHandler === "function") ok("宿主端在 /api 上注册了 soundPlayer/* 拦截");
+  else fail("宿主端未注册 /api 拦截");
 
   mod.apply(ctx);
   await delay(60); // 等 refreshLibrary() 完成
-  if (lastRpcChannel === "soundPlayer") ok("客户端优先走专用通道 soundPlayer");
-  else fail("客户端首选通道 = " + lastRpcChannel);
+  if (lastRpcChannel === "/api" && rpcEndpoints.includes("soundPlayer/tree")) {
+    ok("客户端请求形态 = /api + soundPlayer/tree（与浏览器 POST 路径一致）");
+  } else fail("客户端请求 = " + lastRpcChannel + " / " + rpcEndpoints.join(","));
 
   // 0) no session yet -> must not attach
   callList();
@@ -681,19 +685,25 @@ function report() {
     else fail("UI: 停止键 " + stopBtns.length + " 个，标签 " + JSON.stringify(stopLabels.slice(0, 2)));
   }
 
-  // 12) 专用通道不可用时，退回 /api 拦截通道（宿主只注册了一种的情况）
-  const savedHandle = hostHandleHandler;
-  const mod2 = factory((n) => { if (n === "react") return React; throw new Error("unexpected require: " + n); });
-  hostHandleHandler = null;
-  lastRpcChannel = null;
-  mod2.apply(ctx);
-  await delay(60);
-  const tree2 = globalThis.window.__dshSoundPlayer__.getLibraryTree();
-  if (tree2 && tree2.children.length === 3) ok("专用通道不可用时退回 /api 拦截通道");
-  else fail("回退后仍读不到库: " + (tree2 ? tree2.children.length : "null"));
-  if (lastRpcChannel === "/api") ok("回退确实走了共享通道 /api（lastRpcChannel=" + lastRpcChannel + "）");
-  else fail("回退通道 = " + lastRpcChannel);
-  hostHandleHandler = savedHandle;
+  // 12) 宿主未就绪时也能恢复：先不提供 connection，apply 后补上，重试应能注册成功
+  const savedIntercept = hostInterceptHandler;
+  hostInterceptHandler = null;
+  let lateRpc = null;
+  const lateCtx = {
+    get: (k) => (k === "connection" ? (lateRpc ? { rpc: { intercept: (channel, matches, h) => { hostInterceptHandler = h; return async () => {}; } } } : undefined) : undefined),
+    on: () => {},
+  };
+  const hostMod2 = await import(pathToFileURL(path.join(__dirname, "..", "lib", "index.js")).href + "?late=" + Date.now());
+  hostMod2.apply(lateCtx); // 此刻没有 connection
+  if (!hostInterceptHandler) ok("connection 未就绪时不注册、也不抛错（写好状态并等待）");
+  else fail("connection 未就绪却注册成功？");
+  // 服务稍后出现：宿主应重试成功
+  await delay(700);
+  lateRpc = { rpc: {} };
+  await delay(900);
+  if (typeof hostInterceptHandler === "function") ok("connection 稍后就绪后重试注册成功");
+  else fail("重试未能在服务就绪后完成注册");
+  hostInterceptHandler = savedIntercept;
 
   report();
 })();
