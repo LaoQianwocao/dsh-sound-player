@@ -1081,7 +1081,7 @@ window.__ModuleLoader__.load({
 		 * 级联音效选择器：顶层是三个库，鼠标悬停（或点击）文件夹即在右侧展开其内容，
 		 * 子文件夹继续向右展开，支持任意层级。叶子是音效，点击即绑定。
 		 */
-		function SoundPicker({ value, tree, disabled, onPick, onDelete, onTest }) {
+		function SoundPicker({ value, tree, disabled, onPick, onDelete }) {
 			const [open, setOpen] = React.useState(false);
 			const [levels, setLevels] = React.useState([]); // [{ nodes, left, top }]
 			const wrapRef = React.useRef(null);
@@ -1139,7 +1139,9 @@ window.__ModuleLoader__.load({
 						if (el) rowRects.current.set(node.path, el.getBoundingClientRect());
 						else rowRects.current.delete(node.path);
 					},
-					onMouseEnter: () => { if (isDir) expandDir(level, node); else { collapseDeeper(level); if (typeof onTest === "function") onTest(node.path); } },
+					// 悬停只用来展开/收起子菜单，不播放任何声音：
+					// 试听一律由【设置】面板里的【试听】按钮触发。
+					onMouseEnter: () => { if (isDir) expandDir(level, node); else collapseDeeper(level); },
 					onClick: () => {
 						if (isDir) { expandDir(level, node); return; }
 						onPick(node.path);
@@ -1250,7 +1252,6 @@ window.__ModuleLoader__.load({
 						value: sit.audioId || "",
 						tree,
 						onPick: (path) => onChange({ audioId: path || null }),
-						onTest: onPreview,
 						onDelete: onDeleteSound
 					}),
 					h("button", {
@@ -1391,8 +1392,7 @@ window.__ModuleLoader__.load({
 							h("input", { type: "checkbox", checked: !!state.enabled, onChange: (e) => board.setEnabled(e.target.checked) }),
 							h("span", { className: "dsp-knob" })
 						),
-						h("span", { className: "dsp-label" }, "启用音效播放器"),
-						h("button", { className: "dsp-btn", onClick: () => board.stopAll() }, "停止")
+						h("span", { className: "dsp-label" }, "启用音效播放器")
 					)
 				),
 				h("div", { className: "dsp-sec" },

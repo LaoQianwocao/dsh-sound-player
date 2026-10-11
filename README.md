@@ -12,11 +12,13 @@
 ## 功能
 
 1. **设置页音效播放器**（设置 → 音效播放器）
-   - 总开关（**只有总开关**：没有全局音量，也没有「仅当前会话响铃」）；
+   - 总开关（**只有总开关**：没有全局音量、没有「仅当前会话响铃」，也没有多余的「停止」按钮）；
    - 为每种「情况」绑定音效并开关，显示格式如 `【√】发送消息时播放【提示音1】`；
    - **级联式音效选择器**：下拉里是三个音效库，鼠标悬停文件夹即在右侧展开内容，
      子文件夹继续向右展开（支持任意层级）；选择器只显示音效名、不铺路径文字，
      名称 / 选择器 / 按钮按固定列宽纵向对齐；
+   - **悬停只用于展开菜单，不会发出任何声音**——试听一律由下面【设置】面板里的
+     【试听】按钮触发（此前悬停会误播「当前已绑定」的音频，已修正）；
    - **每条绑定都有一个【设置】面板**（点开后在行下方展开）：音量滑块、
      播放区间「起点 —— 终点」（毫秒，精确到 ms，默认全播放；导入的长音频可以只播其中一小段）、
      特效（目前提供「渐弱消失」）、以及【试听】；
@@ -65,6 +67,8 @@
    - 导入音频：`importAudioFile(file)` / `importAudioFiles(files)` / `importAudioDir(files)`（一律写入自定义音效库）
    - 音效库：`getLibraryTree()` / `refreshLibrary()` / `openLibrary(path?)` / `listSounds()` / `listSoundsMeta()` / `previewSound(path)` / `deleteSound(path)`（仅自定义库）
    - 试听（带该条的音量 / 区间 / 特效）：`previewSituation(id)` → 返回可 `stop()` 的声部句柄 / `stopPreview()` / `getSoundInfo(path)`（取时长，毫秒）
+   - `previewSound(path)` 仍可用（整条试听某个库内音效，供其他插件调用）；设置页自身不再用它——
+     界面里的试听只发生在【设置】面板的按钮上。
    - 增添情况：`addSituation({ label, trigger, audioId?, enabled?, volume? })` → 返回 id
    - 触发情况并播放音效：`triggerSituation(id)` / `trigger(id)`
    - 修改情况：`setSituation(id, patch)`、`setSituationEnabled(id, b)`、`setSituationAudio(id, audioId)`、`setSituationVolume(id, v)`、`removeSituation(id)`

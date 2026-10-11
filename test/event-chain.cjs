@@ -203,8 +203,13 @@ async function hostDispatch(channel, endpoint, payload) {
 // 1 opens the 【设置】 panel (试听 处于未播放态)，2 再打开 playing 以渲染停止键。
 let FORCE_FALSE_COUNT = 0;
 let FORCE_LEFT = 0;
+let RECORD_ELEMENTS = false;    // 打开后记录每次 createElement 的 props（用于断言 props 形态）
+const CREATED = [];
 const React = {
-  createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
+  createElement: (type, props, ...children) => {
+    if (RECORD_ELEMENTS) CREATED.push({ type, props: props || {} });
+    return { type, props: props || {}, children };
+  },
   useState: (v) => {
     const initial = typeof v === "function" ? v() : v;
     let value = initial;
@@ -654,6 +659,20 @@ function report() {
     const settingsBtns = btnTexts.filter((t) => t.indexOf("设置") >= 0).length;
     if (settingsBtns === count) ok("UI: " + count + " 【设置】buttons");
     else fail("UI: " + settingsBtns + " 【设置】buttons (expect " + count + ")");
+
+    // 总开关右侧那个「停止」按钮已删除（面板里的「■ 停止」不在收起态渲染里）
+    if (!btnTexts.includes("停止")) ok("UI: 总开关右侧的「停止」按钮已移除");
+    else fail("UI: 仍存在「停止」按钮");
+
+    // 悬停不再试听：选择器元素不得带 onTest（试听只由【设置】面板的按钮触发）
+    CREATED.length = 0;
+    RECORD_ELEMENTS = true;
+    renderNodes(React.createElement(REGISTERED[0].component, { board }), []);
+    RECORD_ELEMENTS = false;
+    const pickerEls = CREATED.filter((e) => e.props && "onPick" in e.props && "tree" in e.props);
+    const withOnTest = pickerEls.filter((e) => "onTest" in e.props);
+    if (pickerEls.length === count && withOnTest.length === 0) ok("UI: " + count + " 个选择器都不再挂悬停试听（无 onTest）");
+    else fail("UI: 选择器 " + pickerEls.length + " 个，其中 " + withOnTest.length + " 个仍带 onTest");
 
     // 音效库导入区不再列出音效，改为三个按钮
     const sndRows = nodes.filter((n) => typeof n.props.className === "string" && n.props.className.indexOf("dsp-snd-row") >= 0);
