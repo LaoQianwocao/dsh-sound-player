@@ -169,20 +169,33 @@ console.warn = (...a) => { warns.push(a.join(" ")); };
 
 vm.runInThisContext(code, { filename: target });
 
-// —— 先把宿主端接上：捕获它注册的两种 handler ——
+// —— 先把宿主端接上：捕获它注册的精确 Fetch 路由 ——
 const hostModPromise = import(pathToFileURL(path.join(__dirname, "..", "lib", "index.js")).href);
-let hostHandleHandler = null;   // rpc.handle("soundPlayer", …) 注册的（endpoint 不带前缀）
-let hostInterceptHandler = null; // rpc.intercept("/api", …) 注册的（endpoint 带前缀）
-let hostHandleChannel = null;
+const hostRoutes = new Map();   // path -> { path, methods, fetch }
+let hostDispose = null;
 let lastRpcChannel = null;      // 客户端最后一次实际使用的通道
 let lastRpcEndpoint = null;     // 以及端点（应为 soundPlayer/<name>）
 const rpcEndpoints = [];        // 本次跑过的所有端点
-let hostHandler = (endpoint, payload) => {
-  // 兼容旧断言用的直接调用：优先专用通道，退回拦截通道。
-  if (hostHandleHandler) return hostHandleHandler(endpoint.replace(/^soundPlayer\//, ""), payload);
-  if (hostInterceptHandler) return hostInterceptHandler(endpoint, payload);
-  return Promise.resolve({ ok: false, error: { code: "x", message: "no host handler", details: {} } });
-};
+/**
+ * 忠实还原浏览器端 connection.rpc.call：POST /api/<endpoint>，
+ * 请求体是 client-request 信封，响应是 server-response 信封。
+ */
+async function hostDispatch(channel, endpoint, payload) {
+  const path = "/" + String(channel).replace(/^\//, "") + "/" + endpoint;
+  const route = hostRoutes.get(path);
+  if (!route) throw new Error("transport failure for " + channel + "/" + endpoint + ": HTTP 404");
+  const rpcId = "t-" + Math.random().toString(36).slice(2);
+  const request = new Request("http://127.0.0.1" + path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ type: "client-request", rpcId, method: endpoint, payload: payload || {} }),
+  });
+  const response = await route.fetch(request);
+  if (!response.ok) throw new Error("transport failure for " + channel + "/" + endpoint + ": HTTP " + response.status);
+  const envelope = await response.json();
+  if (envelope.rpcId !== rpcId) throw new Error("rpcId mismatch");
+  return envelope.result;
+}
 
 // Minimal element tree instead of null, so the rendered settings page can be
 // asserted structurally (function components are invoked by renderNodes below).
@@ -238,19 +251,14 @@ const sessions = {
 const connection = {
   generation: { getSnapshot: () => gen, subscribe: (cb) => { genListener = cb; return () => {}; } },
   state: { getSnapshot: () => connState, subscribe: (cb) => { stateListener = cb; return () => {}; } },
-  // 音效库走真实的宿主端点：按通道分发到宿主注册的两种 handler 之一，
+  // 音效库走宿主端注册的精确 Fetch 路由（含真实信封与 Request/Response），
   // 这样客户端测试读的是 sounds/ 里真实的文件。
   rpc: {
     call: async (channel, endpoint, payload) => {
       lastRpcChannel = channel;
       lastRpcEndpoint = endpoint;
       rpcEndpoints.push(endpoint);
-      if (channel === "soundPlayer") {
-        if (!hostHandleHandler) throw new Error("专用通道未注册");
-        return hostHandleHandler(endpoint, payload);
-      }
-      if (!hostInterceptHandler) throw new Error("共享通道未注册");
-      return hostInterceptHandler(endpoint, payload);
+      return hostDispatch(channel, endpoint, payload);
     },
   },
 };
@@ -322,21 +330,27 @@ function report() {
 }
 
 (async () => {
-  // 先把宿主端挂上并捕获它的两种注册，再 apply 客户端。
+  // 先把宿主端挂上并捕获它的精确路由，再 apply 客户端。
+  // 桩里的 rpc.intercept/handle 一旦被碰就抛错：那两个 API 是每通道单槽位，
+  // 插件用了会顶掉网关自己的 /api 分发（曾导致 welcome 请求 404、桌面端起不来）。
   const hostMod = await hostModPromise;
   hostMod.apply({
     get: (k) => (k === "connection" ? {
+      fetch: {
+        register: (route) => {
+          hostRoutes.set(route.path, route);
+          return async () => { hostRoutes.delete(route.path); };
+        },
+      },
       rpc: {
-        // 专用通道：endpoint 不带前缀（tree / read / …）
-        handle: (channel, h) => { hostHandleChannel = channel; hostHandleHandler = h; return async () => {}; },
-        // 共享通道拦截：endpoint 形如 soundPlayer/tree
-        intercept: (channel, matches, h) => { hostInterceptHandler = h; return async () => {}; },
+        intercept: () => { throw new Error("禁止使用 rpc.intercept"); },
+        handle: () => { throw new Error("禁止使用 rpc.handle"); },
       },
     } : undefined),
-    on: () => {},
+    on: (ev, cb) => { if (ev === "dispose") hostDispose = cb; },
   });
-  if (typeof hostInterceptHandler === "function") ok("宿主端在 /api 上注册了 soundPlayer/* 拦截");
-  else fail("宿主端未注册 /api 拦截");
+  if (hostRoutes.size === 6) ok("宿主端注册了 6 条精确 Fetch 路由（未占用拦截器槽位）");
+  else fail("宿主端路由数 = " + hostRoutes.size);
 
   mod.apply(ctx);
   await delay(60); // 等 refreshLibrary() 完成
@@ -686,24 +700,22 @@ function report() {
   }
 
   // 12) 宿主未就绪时也能恢复：先不提供 connection，apply 后补上，重试应能注册成功
-  const savedIntercept = hostInterceptHandler;
-  hostInterceptHandler = null;
-  let lateRpc = null;
+  let lateConnection = null;
+  const lateRoutes = new Map();
   const lateCtx = {
-    get: (k) => (k === "connection" ? (lateRpc ? { rpc: { intercept: (channel, matches, h) => { hostInterceptHandler = h; return async () => {}; } } } : undefined) : undefined),
+    get: (k) => (k === "connection" ? lateConnection : undefined),
     on: () => {},
   };
   const hostMod2 = await import(pathToFileURL(path.join(__dirname, "..", "lib", "index.js")).href + "?late=" + Date.now());
   hostMod2.apply(lateCtx); // 此刻没有 connection
-  if (!hostInterceptHandler) ok("connection 未就绪时不注册、也不抛错（写好状态并等待）");
+  if (lateRoutes.size === 0) ok("connection 未就绪时不注册、也不抛错（写好状态并等待）");
   else fail("connection 未就绪却注册成功？");
   // 服务稍后出现：宿主应重试成功
   await delay(700);
-  lateRpc = { rpc: {} };
+  lateConnection = { fetch: { register: (route) => { lateRoutes.set(route.path, route); return async () => { lateRoutes.delete(route.path); }; } } };
   await delay(900);
-  if (typeof hostInterceptHandler === "function") ok("connection 稍后就绪后重试注册成功");
-  else fail("重试未能在服务就绪后完成注册");
-  hostInterceptHandler = savedIntercept;
+  if (lateRoutes.size === 6) ok("connection 稍后就绪后重试注册成功（" + lateRoutes.size + " 条路由）");
+  else fail("重试未能在服务就绪后完成注册: " + lateRoutes.size);
 
   report();
 })();

@@ -1,7 +1,12 @@
 /* 宿主端音效库端点的无头测试。
  *
- * 用桩 ctx 捕获 `connection.rpc.intercept` 注册的 handler，然后直接调用它，
- * 断言目录树 / 读取 / 导入 / 路径越界防护。不会真的打开资源管理器。
+ * 用桩 ctx 捕获 `connection.fetch.register` 注册的精确 Fetch 路由，然后构造真实
+ * Request 打进去，按生成式 Remote 的信封（server-response）取回结果 —— 与浏览器端
+ * connection.rpc.call 的行为一致。
+ *
+ * 安全回归：桩里的 `connection.rpc.intercept/handle` 一旦被调用就抛错 ——
+ * 那两个 API 属于「每通道单槽位」，插件用了会顶掉网关自己的 /api 分发
+ * （表现为桌面端起不来、welcome 请求 404）。本插件必须只用精确路由。
  *
  * 用法: node test/library-host.cjs
  */
@@ -28,42 +33,62 @@ function countType(nodes, type) {
 (async () => {
 	const mod = await import(pathToFileURL(path.join(root, "lib", "index.js")).href);
 
-	// —— 桩 ctx：捕获两种注册 ——
-	let handleHandler = null;    // rpc.handle("soundPlayer", …)：endpoint 不带前缀
-	let interceptHandler = null; // rpc.intercept("/api", …)：endpoint 带 soundPlayer/ 前缀
-	let handleChannel = null;
-	const disposers = [];
+	// —— 桩 ctx：捕获精确 Fetch 路由；碰 rpc.intercept/handle 就直接失败 ——
+	const routes = new Map();
+	let disposeCb = null;
 	const ctx = {
 		get: (key) => (key === "connection" ? {
-			rpc: {
-				handle: (channel, h) => {
-					handleChannel = channel;
-					handleHandler = h;
-					return async () => { disposers.push("handle"); };
-				},
-				intercept: (channel, matches, h) => {
-					if (channel !== "/api") throw new Error("channel 应为 /api");
-					if (!matches("soundPlayer/tree")) throw new Error("matches 应接受 soundPlayer/tree");
-					if (matches("session/list")) throw new Error("matches 不应接受其它端点");
-					interceptHandler = h;
-					return async () => { disposers.push("intercept"); };
+			fetch: {
+				register: (route) => {
+					if (routes.has(route.path)) throw new Error("重复路由: " + route.path);
+					routes.set(route.path, route);
+					return async () => { routes.delete(route.path); };
 				},
 			},
+			rpc: {
+				intercept: () => { throw new Error("禁止使用 rpc.intercept：会顶掉网关的 /api 分发"); },
+				handle: () => { throw new Error("禁止使用 rpc.handle：本插件不需要专用通道"); },
+			},
 		} : undefined),
-		on: (ev, cb) => { if (ev === "dispose") disposers.push(cb); },
+		on: (ev, cb) => { if (ev === "dispose") disposeCb = cb; },
 	};
 
 	mod.apply(ctx);
-	if (typeof interceptHandler === "function") ok("在 /api 共享通道上注册了拦截（浏览器唯一可达的通道）");
-	else fail("未注册 /api 拦截");
-	if (typeof handleHandler === "function") ok("同时注册了宿主侧专用通道 " + handleChannel);
-	else fail("未注册专用通道");
-	if (Array.isArray(mod.inject) && mod.inject.includes("connection")) ok("inject 声明了 connection 依赖（避免早于服务就绪而拿不到 rpc）");
+	if (routes.size === 6) ok("注册了 6 条精确 Fetch 路由: " + [...routes.keys()].map((p) => p.replace("/api/soundPlayer/", "")).join(", "));
+	else fail("路由数异常: " + routes.size + " -> " + [...routes.keys()].join(", "));
+	if (Array.isArray(mod.inject) && mod.inject.includes("connection")) ok("inject 声明了 connection 依赖（避免早于服务就绪）");
 	else fail("inject 应包含 connection，实际: " + JSON.stringify(mod.inject));
+	if (typeof disposeCb === "function") ok("注册了 dispose 回调");
+	else fail("未注册 dispose 回调");
 
-	// 专用通道用不带前缀的 endpoint；共享通道用带前缀的 endpoint（内部剥掉前缀）。
-	const handler = (name, payload) => handleHandler(name, payload);
-	const viaIntercept = (name, payload) => interceptHandler("soundPlayer/" + name, payload);
+	/** 直接打某条路由，返回 { status, result }（模拟 connection.rpc.call 的两端）。 */
+	const rawCall = async (name, payload, options = {}) => {
+		const endpoint = "soundPlayer/" + name;
+		const route = routes.get("/api/" + endpoint);
+		if (!route) return { status: 404, result: null, missing: true };
+		const rpcId = "test-" + Math.random().toString(36).slice(2);
+		const method = options.methodField || endpoint;
+		const body = options.rawBody === undefined
+			? JSON.stringify({ type: "client-request", rpcId, method, payload: payload === undefined ? {} : payload })
+			: options.rawBody;
+		const request = new Request("http://127.0.0.1/api/" + endpoint, {
+			method: options.method || "POST",
+			headers: { "content-type": options.contentType || "application/json" },
+			// GET/HEAD 不能带 body（undici 会直接抛错）
+			...((options.method || "POST") === "POST" ? { body } : {}),
+		});
+		const response = await route.fetch(request);
+		if (!response.ok) return { status: response.status, result: null };
+		const envelope = await response.json();
+		if (envelope.rpcId !== rpcId) return { status: 200, result: null, rpcIdMismatch: true };
+		return { status: 200, result: envelope.result };
+	};
+	/** 模拟浏览器端：非 2xx 抛 transport failure，与真实 rpc.call 一致。 */
+	const handler = async (name, payload) => {
+		const { status, result } = await rawCall(name, payload);
+		if (status !== 200) throw new Error("transport failure for /api/soundPlayer/" + name + ": HTTP " + status);
+		return result;
+	};
 
 	// —— tree ——
 	const tree = await handler("tree", {});
@@ -143,7 +168,6 @@ function countType(nodes, type) {
 		const p = path.join(customDir, f);
 		if (fs.existsSync(p)) fs.unlinkSync(p);
 	}
-	// 状态文件是宿主运行时产物，等下面的断言读完之后再删（避免与真实 app 的写入混淆）。
 	const statusFile = path.join(libRoot, ".host-status.json");
 	const left = fs.existsSync(customDir) ? fs.readdirSync(customDir).filter((f) => !f.startsWith(".")) : [];
 	if (left.length === 0) ok("测试产物已清理，自定义音效库为空");
@@ -156,28 +180,36 @@ function countType(nodes, type) {
 		if (counts["神人音效库"] === 34 && counts["默认音效库"] === 11) ok("status 回报库位置与条目数（默认 11 / 神人 34）");
 		else fail("status counts = " + JSON.stringify(counts));
 	} else fail("status 失败: " + JSON.stringify(status.error || status.value));
-	const markerFile = path.join(libRoot, ".host-status.json");
-	if (fs.existsSync(markerFile)) {
-		const recorded = JSON.parse(fs.readFileSync(markerFile, "utf8"));
-		if (recorded.registeredHandle || recorded.registeredIntercept) ok("apply 写下了 .host-status.json（可判断宿主是否加载了新代码）");
-		else fail("状态文件未记录注册结果: " + JSON.stringify(recorded));
+	if (fs.existsSync(statusFile)) {
+		const recorded = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+		if (Array.isArray(recorded.registeredRoutes) && recorded.registeredRoutes.length === 6) ok("apply 写下 .host-status.json 并记录 6 条路由");
+		else fail("状态文件未记录路由: " + JSON.stringify(recorded));
 	} else fail("未写出 .host-status.json");
 
-	// —— 共享通道（带前缀）也能用 ——
-	const viaApi = await viaIntercept("tree", {});
-	if (viaApi.ok && viaApi.value.children.length === 3) ok("/api 拦截通道同样可用（endpoint 带前缀）");
-	else fail("/api 拦截通道失败: " + JSON.stringify(viaApi.error || viaApi.value));
+	// —— 协议细节 ——
+	const notPost = await rawCall("tree", {}, { method: "GET" });
+	if (notPost.status === 404) ok("非 POST 命中路由时返回 404");
+	else fail("非 POST 返回 " + notPost.status);
+	const badType = await rawCall("tree", {}, { contentType: "text/plain" });
+	if (badType.status === 415) ok("内容类型不是 JSON 时返回 415");
+	else fail("错误内容类型返回 " + badType.status);
+	const badJson = await rawCall("tree", {}, { rawBody: "{not json" });
+	if (badJson.status === 400) ok("请求体不是 JSON 时返回 400");
+	else fail("坏 JSON 返回 " + badJson.status);
+	const mismatch = await rawCall("tree", {}, { methodField: "soundPlayer/other" });
+	if (mismatch.status === 200 && mismatch.result && !mismatch.result.ok && mismatch.result.error.code === "gateway/bad-request") ok("method 与端点名不符时返回结构化错误");
+	else fail("method 不符未报错: " + JSON.stringify(mismatch));
 
-	// —— 未知端点 ——
-	const unknown = await handler("nope", {});
-	if (!unknown.ok && unknown.error.code === "soundPlayer/unknown-endpoint") ok("未知端点返回结构化错误");
-	else fail("未知端点处理异常");
+	// —— 未注册路径不应被本插件接管 ——
+	const nowhere = await rawCall("nope", {});
+	if (nowhere.status === 404 && nowhere.missing) ok("未注册端点 404（路由只覆盖自己的 6 条路径）");
+	else fail("未注册端点返回 " + JSON.stringify(nowhere));
 
-	// —— dispose 时释放端点 ——
-	const before = disposers.length;
-	for (const d of disposers.slice()) { try { await d(); } catch (e) { /* 忽略 */ } }
-	if (disposers.length >= before && disposers.includes("handle") && disposers.includes("intercept")) ok("dispose 会释放两种端点注册");
-	else fail("dispose 未释放端点: " + JSON.stringify(disposers));
+	// —— dispose 释放路由 ——
+	const before = routes.size;
+	if (typeof disposeCb === "function") await disposeCb();
+	if (routes.size === 0) ok("dispose 会释放全部 " + before + " 条路由");
+	else fail("dispose 后仍有路由: " + [...routes.keys()].join(", "));
 
 	// 最后清掉运行时状态文件：让「重启后是否出现」成为宿主加载新代码的判据。
 	if (fs.existsSync(statusFile)) fs.unlinkSync(statusFile);

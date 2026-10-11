@@ -34,15 +34,23 @@
    - 三个库都由宿主端（`lib/index.js`）读取，客户端经已认证的 RPC 通道取字节并按需解码缓存；
      内置两库不可删，自定义库可在选择器里直接删。
    - 默认的 7 种情况仍绑定原来的内置音效，开箱即用。
-   - ⚠️ **宿主半段（`lib/index.js`）改动必须重启 DSH 桌面端才会生效**，只刷新页面不够。
-     宿主端 `inject` 声明了 `connection` 依赖（否则 apply 可能早于服务就绪、拿不到 `rpc`），
-     拿不到服务时会按 500ms 重试（最多 30 秒），每次尝试的结果都写进
-     `sounds/.host-status.json`（库根目录、`hasConnection` / `hasRpc` / `registeredIntercept`、
-     尝试次数、connection 服务成员）。**读这个文件就能判断宿主加载的是不是新代码、卡在哪一步**；
-     它由运行中的应用写入，测试跑完会自行删除。
    - 客户端与宿主的调用形态：浏览器把 `channel/endpoint` 拼成 HTTP 路径 POST
-     （`api/soundPlayer/tree`），因此只有 `/api` 可达，endpoint 必须带 `soundPlayer/` 前缀；
-     宿主用 `ctx.connection.rpc.intercept("/api", ep => ep.startsWith("soundPlayer/"), …)` 接入同一条链路。
+     （`/api/soundPlayer/tree`），请求体是生成式 Remote 同款信封
+     （`{ type: "client-request", rpcId, method, payload }`），响应
+     `{ type: "server-response", rpcId, result }`。
+   - ⚠️ **宿主端点必须用精确 Fetch 路由注册**：`ctx.connection.fetch.register({ path: "/api/soundPlayer/<name>", methods: ["POST"], … })`。
+     共享通道 `/api` 的分发顺序是「精确路由 → 该通道**唯一**的拦截器 → 404」，而
+     `ctx.connection.rpc.intercept("/api", …)` 是**单槽位**、已存在时直接抛错：
+     插件一旦抢到那个槽位就会顶掉网关自己的分发，**所有生成式 Remote（含桌面端启动时
+     的 welcome settings 读取）都会 404，足以让应用打不开**。精确路由是附加式、
+     优先级更高、不影响任何其它端点 —— `test/library-host.cjs` 里对
+     `rpc.intercept` / `rpc.handle` 设了「一碰就报错」的回归护栏。
+   - ⚠️ **宿主半段（`lib/index.js`）改动必须重启 DSH 桌面端才会生效**，只刷新页面不够。
+     宿主端 `inject` 声明了 `connection` 依赖；服务尚未就绪时会按 500ms 重试（最多 30 秒），
+     每次尝试都写进 `sounds/.host-status.json`（库根目录、`hasConnection` /
+     `hasFetchRegister` / `registeredRoutes` / 尝试次数 / connection 服务成员）。
+     **读这个文件就能判断宿主加载的是不是新代码、卡在哪一步**；它由运行中的应用写入，
+     测试跑完会自行删除。
 
 3. **内置情况**
    - 对话完成提示（`turn-end`）
