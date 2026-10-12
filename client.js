@@ -1049,7 +1049,9 @@ window.__ModuleLoader__.load({
 .dsp-snd-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
 .dsp-snd-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dsp-hint { color: var(--dsw-alias-label-tertiary, #6b7280); font-size: 11px; line-height: 1.5; }
-.dsp-scroll { max-height: 180px; overflow-y: auto; }
+/* 绑定列表：展开【设置】面板后要能完整显示，所以给足高度（随窗口自适应）。
+   scroll-behavior 让「点设置自动滚到合适位置」平滑一些。 */
+.dsp-scroll { max-height: clamp(260px, 46vh, 520px); overflow-y: auto; scroll-behavior: smooth; }
 .dsp-divider { height: 1px; background: var(--dsw-alias-border-l2, rgba(255,255,255,.08)); margin: 4px 0; }
 /* —— 级联音效选择器 —— */
 .dsp-picker { position: relative; flex: none; }
@@ -1194,9 +1196,26 @@ window.__ModuleLoader__.load({
 			const [duration, setDuration] = React.useState(0);
 			const [playing, setPlaying] = React.useState(false);
 			const [busy, setBusy] = React.useState(false);
+			const blockRef = React.useRef(null);
 			const vol = typeof sit.volume === "number" ? sit.volume : DEFAULT_VOLUME;
 			const clipStart = typeof sit.clipStart === "number" ? sit.clipStart : 0;
 			const clipEnd = typeof sit.clipEnd === "number" ? sit.clipEnd : null;
+
+			// 展开面板后把这一块滚到列表可视区的顶部附近，保证面板完整可见。
+			React.useEffect(() => {
+				if (!open) return;
+				const el = blockRef.current;
+				if (!el || typeof el.getBoundingClientRect !== "function") return;
+				const container = el.closest ? el.closest(".dsp-scroll") : null;
+				if (!container) {
+					if (typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+					return;
+				}
+				const delta = el.getBoundingClientRect().top - container.getBoundingClientRect().top;
+				const top = Math.max(0, container.scrollTop + delta - 8);
+				if (typeof container.scrollTo === "function") container.scrollTo({ top, behavior: "smooth" });
+				else container.scrollTop = top;
+			}, [open]);
 
 			// 展开时（或换了音效后）取一次时长，用于「全播放」与区间上限提示。
 			React.useEffect(() => {
@@ -1234,7 +1253,7 @@ window.__ModuleLoader__.load({
 				else onChange({ [key]: Math.round(n) });
 			};
 
-			return h("div", { className: "dsp-sit-block" },
+			return h("div", { className: "dsp-sit-block", ref: blockRef },
 				h("div", { className: "dsp-sit-row" },
 					h("label", { className: "dsp-toggle", title: sit.enabled ? "已启用" : "已停用" },
 						h("input", {
