@@ -56,8 +56,11 @@
 - 权限请求时提示（`approval-requested`）
 - 被提问时提示（AI 弹 `ask_user_question`，`question-requested`）
 - 服务终止时提示（连接断开，`stream-end`）
-- **子代理运行完成**（`subagent-complete`，任意子代理跑完）
-- **最后一个子代理运行完成**（`last-subagent-complete`，所有会话中运行中的子代理全部完成）
+- **子代理运行完成**（`subagent-complete`）：任意子代理的 `running` 由真变假。
+  注意 **Agent Teams 的队友是可续跑（continuable）的子代理**，所以这条的含义是
+  「某个子代理结束了一轮」——队友随时可被唤醒继续干活，不等于任务彻底做完；
+- **最后一个子代理运行完成**（`last-subagent-complete`）：**所有会话**中运行中的子代理数量
+  从 ≥1 归零。队友全部暂时空闲（例如 Lead 正在思考/等待）时也会触发。
 
 ## 安装
 
@@ -207,6 +210,17 @@ ctx.connection.fetch.register({
 
 `sessions.list` 与 `connection.generation` 属于客户端运行时的内部快照存储，未出现在官方客户端服务契约
 （cordis-inspect 目录）里。插件对它们的读取都做了判空与 `try/catch`：接口缺失时静默降级，不影响其他功能。
+`origin === "subagent"` 与 `running` 这两个字段本身是官方客户端 UI 在用的（`useSessions` 的
+`byId[id]?.origin === "subagent"`、`runningChildCount()` 里的 `byId[child.id]?.running`），
+所以子代理识别与运行状态的口径与官方界面一致。
+
+**与官方「完成未读」口径的差异（有意为之）**：官方 `uiSession` 服务的 `sessionStatus` 只在
+「会话不在主视图」时才记一次完成未读 —— `observeRunning()` 里是
+`else if (… && !this.isMain(sessionId)) this.completionUnread.add(sessionId)`，
+且它跟踪**所有**会话。本插件按要求**不做会话过滤**：任何会话（含你正在看的那个）里子代理的
+`running` 翻转都会响，且只对 `origin === "subagent"` 的行响。
+（`uiSession` 未出现在 cordis-inspect 的客户端服务目录里，插件无法确认能否取到它，
+因此仍用公开可读的列表行 —— 也就是官方代码里的兜底路径。）
 
 </details>
 
