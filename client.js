@@ -1057,7 +1057,7 @@ window.__ModuleLoader__.load({
 .dsp-picker { position: relative; flex: none; }
 .dsp-picker-btn { width: 170px; min-width: 170px; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
 .dsp-picker-btn .dsp-caret { opacity: .6; margin-left: 4px; }
-.dsp-menu { position: fixed; z-index: 60; min-width: 172px; max-height: 340px; overflow-y: auto; padding: 4px; border: 1px solid var(--dsw-alias-border-l2, rgba(255,255,255,.14)); border-radius: 10px; background: var(--dsw-alias-bg-layer-3, #1f2430); box-shadow: 0 8px 26px rgba(0,0,0,.38); }
+.dsp-menu { position: fixed; z-index: 60; min-width: 172px; max-height: 340px; overflow-y: auto; overscroll-behavior: contain; padding: 4px; border: 1px solid var(--dsw-alias-border-l2, rgba(255,255,255,.14)); border-radius: 10px; background: var(--dsw-alias-bg-layer-3, #1f2430); box-shadow: 0 8px 26px rgba(0,0,0,.38); }
 .dsp-menu-item { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 7px; cursor: pointer; font-size: 12px; color: var(--dsw-alias-label-primary, #e5e7eb); white-space: nowrap; }
 .dsp-menu-item:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,.12)); }
 .dsp-menu-item .dsp-menu-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -1087,9 +1087,15 @@ window.__ModuleLoader__.load({
 			const [open, setOpen] = React.useState(false);
 			const [levels, setLevels] = React.useState([]); // [{ nodes, left, top }]
 			const wrapRef = React.useRef(null);
-			const rowRects = React.useRef(new Map());
+			// 存的是「行元素」而不是行矩形：菜单本身可以滚动，缓存的矩形会过期，
+			// 展开子菜单时一律现测（见 expandDir）。
+			const rowEls = React.useRef(new Map());
+			// 最近一次滚动的时间戳：滚轮滚动时行会从光标下面掠过，Chrome 会补发
+			// mouseover，镜头里那行刚好是文件夹就会「滚着滚着弹出个子菜单」，所以滚动后
+			// 短暂忽略悬停展开。
+			const lastScrollAt = React.useRef(0);
 
-			// 打开时用按钮的位置算出第一级面板锚点；滚动或尺寸变化就收起，避免面板飘走。
+			// 打开时用按钮的位置算出第一级面板锚点；面板外的滚动或窗口尺寸变化就收起，避免面板飘走。
 			const openMenu = () => {
 				if (disabled) return;
 				const rect = wrapRef.current ? wrapRef.current.getBoundingClientRect() : null;
@@ -1105,22 +1111,38 @@ window.__ModuleLoader__.load({
 					if (!wrapRef.current || !wrapRef.current.contains(e.target)) closeMenu();
 				};
 				const onKey = (e) => { if (e.key === "Escape") closeMenu(); };
-				const onMove = () => closeMenu();
+				// 滚动要分两种，否则会把「滚动」误判成「点到外面」：
+				//   ① 菜单自己的滚动（滚轮 / 拖右侧滚动条）：scroll 事件在 window 捕获阶段
+				//      也会经过这里，必须放行 —— 这是下拉菜单能滚的前提。滚动后锚点行跟着
+				//      走了，所以顺手把这一级下面的子菜单收掉，免得子菜单悬在半空。
+				//   ② 菜单外的滚动（设置页列表 / 窗口）：面板是 position:fixed，锚点会飘走，收起。
+				const onScroll = (e) => {
+					const target = e ? e.target : null;
+					if (!target || !wrapRef.current || !wrapRef.current.contains(target)) { closeMenu(); return; }
+					lastScrollAt.current = Date.now();
+					const menu = typeof target.closest === "function" ? target.closest(".dsp-menu") : null;
+					if (!menu) return;
+					const level = Number(menu.getAttribute("data-level"));
+					if (!isFinite(level)) return;
+					setLevels((prev) => (prev.length > level + 1 ? prev.slice(0, level + 1) : prev));
+				};
+				const onResize = () => closeMenu();
 				document.addEventListener("pointerdown", onDown, true);
 				document.addEventListener("keydown", onKey);
-				window.addEventListener("scroll", onMove, true);
-				window.addEventListener("resize", onMove);
+				window.addEventListener("scroll", onScroll, true);
+				window.addEventListener("resize", onResize);
 				return () => {
 					document.removeEventListener("pointerdown", onDown, true);
 					document.removeEventListener("keydown", onKey);
-					window.removeEventListener("scroll", onMove, true);
-					window.removeEventListener("resize", onMove);
+					window.removeEventListener("scroll", onScroll, true);
+					window.removeEventListener("resize", onResize);
 				};
 			}, [open]);
 
 			/** 展开第 level 级里某个目录：裁掉更深层级，再挂上新面板。 */
 			const expandDir = (level, node) => {
-				const rect = rowRects.current.get(node.path);
+				const el = rowEls.current.get(node.path);
+				const rect = el && typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
 				if (!rect) return;
 				setLevels((prev) => prev.slice(0, level + 1).concat([{
 					nodes: node.children || [],
@@ -1138,12 +1160,15 @@ window.__ModuleLoader__.load({
 					className: "dsp-menu-item",
 					title: node.path,
 					ref: (el) => {
-						if (el) rowRects.current.set(node.path, el.getBoundingClientRect());
-						else rowRects.current.delete(node.path);
+						if (el) rowEls.current.set(node.path, el);
+						else rowEls.current.delete(node.path);
 					},
 					// 悬停只用来展开/收起子菜单，不播放任何声音：
 					// 试听一律由【设置】面板里的【试听】按钮触发。
-					onMouseEnter: () => { if (isDir) expandDir(level, node); else collapseDeeper(level); },
+					onMouseEnter: () => {
+						if (Date.now() - lastScrollAt.current < 150) return;
+						if (isDir) expandDir(level, node); else collapseDeeper(level);
+					},
 					onClick: () => {
 						if (isDir) { expandDir(level, node); return; }
 						onPick(node.path);
@@ -1171,7 +1196,7 @@ window.__ModuleLoader__.load({
 					title: value ? value : "未绑定音效",
 					onClick: () => (open ? closeMenu() : openMenu())
 				}, label, h("span", { className: "dsp-caret" }, "▾")),
-				!open ? null : h("div", { className: "dsp-menu", style: { left: levels[0] ? levels[0].left : 0, top: levels[0] ? levels[0].top : 0 } },
+				!open ? null : h("div", { className: "dsp-menu", "data-level": 0, style: { left: levels[0] ? levels[0].left : 0, top: levels[0] ? levels[0].top : 0 } },
 					!levels.length || !levels[0].nodes.length
 						? h("div", { className: "dsp-menu-empty" }, "音效库为空")
 						: levels[0].nodes.map((n) => renderRow(0, n))
@@ -1179,6 +1204,7 @@ window.__ModuleLoader__.load({
 				!open ? null : levels.slice(1).map((level, index) => h("div", {
 					key: "lvl-" + (index + 1),
 					className: "dsp-menu",
+					"data-level": index + 1,
 					style: { left: level.left, top: level.top }
 				},
 					level.nodes.length ? level.nodes.map((n) => renderRow(index + 1, n)) : h("div", { className: "dsp-menu-empty" }, "（空文件夹）")
